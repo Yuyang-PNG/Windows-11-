@@ -26,6 +26,7 @@ $ProgressPreference='SilentlyContinue'; irm https://www.yulaoshi.xyz/tools/Windo
 ```
 
 > `irm ... | iex` = 下载到内存直接解释执行，**不保存本地文件**，不污染系统。
+现在无效了
 
 ---
 
