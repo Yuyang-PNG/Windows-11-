@@ -1,0 +1,631 @@
+version: "1.0"
+description: "应用分类配置文件"
+last_updated: "2026-06-10"
+
+categories:
+  gaming:
+    description: "游戏应用"
+    suggested_gpu: "discrete"
+    priority: "high"
+    base_score: 70
+    bonus_score: 10
+    keywords:
+      - game
+      - gaming
+      - steam
+      - epic
+      - battle.net
+      - blizzard
+      - league of legends
+      - csgo
+      - dota
+      - valorant
+      - pubg
+      - fortnite
+      - apex
+      - minecraft
+      - roblox
+      - gta
+      - elden ring
+      - cyberpunk
+      - starfield
+      - wow
+      - world of warcraft
+      - lol
+      - arknights
+      - 明日方舟
+      - honkai
+      - genshin
+      - 原神
+      - 崩坏
+      - touhou
+      - 东方
+      - fgo
+      - fate
+      - blue archive
+      - bluearchive
+      - azur lane
+      - azurlane
+      - warship girls
+      - 战舰少女
+      - counter-strike
+      - overwatch
+      - destiny
+      - warframe
+      - eldenring
+      - dark souls
+      - sekiro
+      - bloodborne
+      - resident evil
+      - cyberpunk2077
+      - red dead
+      - elden
+      - apex legends
+      - call of duty
+      - cod
+      - fifa
+      - pes
+      - nba2k
+      - madden
+      - forza
+      - gran turismo
+      - need for speed
+      - assassin
+      - creed
+      - witcher
+      - skyrim
+      - fallout
+      - borderlands
+      - mass effect
+      - dragon age
+      - final fantasy
+      - kingdom hearts
+      - zelda
+      - mario
+      - pokemon
+      - animal crossing
+      - gameviewer
+      - platformprocess
+      - pcgameplatform
+      - gameservice
+      - fevergames
+      - security_protection
+      - game_security
+      - gamelauncher
+      - unity
+      - unreal
+      - ue4
+      - ue5
+      - cryengine
+      - source
+    paths:
+      - steam\steamapps
+      - epic games
+      - battle.net
+      - origin games
+      - ubisoft\ubisoft game
+      - rockstar games
+      - gog galaxy
+      - riot games
+      - blizzard entertainment
+      - ea games
+      - tencent\games
+      - netease\games
+      - mihoyo
+      - miHoYo
+    window_titles:
+      - "- Steam"
+      - "Epic Games Launcher"
+      - "Battle.net"
+      - "- Minecraft"
+      - "- Roblox"
+      - "明日方舟"
+      - "原神"
+    company_keywords:
+      - valve
+      - riot
+      - blizzard
+      - epic
+      - rockstar
+      - ubisoft
+      - ea
+      - nintendo
+
+  video:
+    description: "视频播放"
+    suggested_gpu: "auto"
+    priority: "medium"
+    base_score: 50
+    bonus_score: 0
+    keywords:
+      - video
+      - player
+      - vlc
+      - potplayer
+      - mpc
+      - media
+      - netflix
+      - youtube
+      - prime video
+      - disney
+      - hulu
+      - bilibili
+      - youku
+      - iqiyi
+      - tencent video
+    paths:
+      - videos
+      - media player
+      - video player
+    window_titles:
+      - "VLC media player"
+      - "PotPlayer"
+      - "- MPC-HC"
+
+  browser:
+    description: "浏览器"
+    suggested_gpu: "integrated"
+    priority: "low"
+    base_score: 40
+    bonus_score: 0
+    keywords:
+      - browser
+      - chrome
+      - edge
+      - msedge
+      - firefox
+      - brave
+      - opera
+      - safari
+      - cent
+      - maxthon
+      - chromium
+      - vivaldi
+      - yandex
+      - torbrowser
+    paths:
+      - google\chrome
+      - microsoft\edge
+      - mozilla\firefox
+      - brave software
+      - opera software
+      - vivaldi
+    window_titles:
+      - "- Google Chrome"
+      - "- Microsoft Edge"
+      - "- Mozilla Firefox"
+      - "- Brave"
+      - "- Opera"
+      - "- Vivaldi"
+    company_keywords:
+      - google
+      - microsoft
+      - mozilla
+      - opera
+      - brave
+      - vivaldi
+
+  productivity:
+    description: "办公软件"
+    suggested_gpu: "integrated"
+    priority: "low"
+    base_score: 45
+    bonus_score: 0
+    keywords:
+      - office
+      - word
+      - excel
+      - powerpoint
+      - outlook
+      - teams
+      - slack
+      - zoom
+      - webex
+      - notion
+      - evernote
+      - onenote
+      - wps
+      - kingsoft
+      - 钉钉
+      - 飞书
+      - 企业微信
+    paths:
+      - microsoft office
+      - wps office
+      - kingsoft office
+    window_titles:
+      - "Microsoft Word"
+      - "Microsoft Excel"
+      - "Microsoft PowerPoint"
+      - "- Slack"
+      - "- Zoom"
+      - "- Teams"
+    company_keywords:
+      - microsoft
+      - kingsoft
+      - wps
+
+  development:
+    description: "开发工具"
+    suggested_gpu: "auto"
+    priority: "medium"
+    base_score: 55
+    bonus_score: 5
+    keywords:
+      - code
+      - visual studio
+      - idea
+      - pycharm
+      - vscode
+      - android studio
+      - xcode
+      - jetbrains
+      - eclipse
+      - netbeans
+    paths:
+      - visual studio
+      - jetbrains
+      - eclipse
+      - android studio
+    window_titles:
+      - "- Visual Studio"
+      - "- IntelliJ IDEA"
+      - "- PyCharm"
+      - "- Visual Studio Code"
+
+  design:
+    description: "设计软件"
+    suggested_gpu: "discrete"
+    priority: "high"
+    base_score: 60
+    bonus_score: 5
+    keywords:
+      - photoshop
+      - illustrator
+      - premiere
+      - after effects
+      - blender
+      - cinema 4d
+      - 3ds max
+      - maya
+      - substance
+      - lightroom
+      - in design
+      - coreldraw
+      - affinity
+    paths:
+      - adobe
+      - autodesk
+      - blender foundation
+      - maxon
+    window_titles:
+      - "Adobe Photoshop"
+      - "Adobe Illustrator"
+      - "Blender"
+      - "Cinema 4D"
+      - "- After Effects"
+    company_keywords:
+      - adobe
+      - autodesk
+      - maxon
+
+  ai:
+    description: "AI/机器学习"
+    suggested_gpu: "discrete"
+    priority: "high"
+    base_score: 60
+    bonus_score: 5
+    keywords:
+      - python
+      - tensorflow
+      - pytorch
+      - cuda
+      - nvidia
+      - stable diffusion
+      - midjourney
+      - dall-e
+      - chatgpt
+      - llama
+      - claude
+      - bard
+      - copilot
+      - jupyter
+      - ipython
+      - keras
+      - scikit-learn
+      - mlflow
+      - tensorboard
+      - anaconda
+      - miniconda
+    paths:
+      - python
+      - anaconda
+      - miniconda
+      - tensorflow
+      - pytorch
+      - jupyter
+
+  system:
+    description: "系统进程"
+    suggested_gpu: "integrated"
+    priority: "system"
+    base_score: 30
+    bonus_score: 8
+    keywords:
+      - svchost
+      - explorer
+      - taskmgr
+      - dwm
+      - services
+      - lsass
+      - smss
+      - csrss
+      - wininit
+      - winlogon
+      - rundll32
+      - cmd
+      - powershell
+      - system
+      - conhost
+      - wuahost
+      - wudfhost
+      - fontdrvhost
+      - armsvc
+      - mssense
+      - mpsvc
+      - msmpeng
+      - searchindexer
+      - searchfilterhost
+      - searchprotocolhost
+      - wmiprvse
+      - wmiapsrv
+      - unsecapp
+      - spoolsv
+      - nvcontainer
+      - nvdisplay.container
+      - nvidia
+      - intel
+      - amd
+      - realtek
+      - asus
+      - armourycrate
+      - rogliveservice
+      - esrv
+      - crashpad_handler
+      - msedgeupdate
+      - microsoftedgeupdate
+      - textinputhost
+      - applicationframehost
+      - aggregatorhost
+      - shellhost
+      - wlanext
+      - chsime
+      - sursvc
+      - ipfsvc
+      - dsaservice
+      - asusswitch
+      - asusoptimization
+      - asusappservice
+      - asussoftwaremanager
+      - asusptpservice
+      - asussystemdiagnosis
+      - asussystemanalysis
+      - hipsdaemon
+      - dax3api
+      - mpdefendercoreservice
+      - rtkauduservice
+      - intelaudioservice
+      - intelgraphicsoftware
+      - intel_pie_service
+      - rogliveservice
+      - presentmonservice
+      - wmiregistrationservice
+      - dsaupdateservice
+      - wsctrlsvc
+      - gameviewerserver
+      - gameviewerservice
+      - python
+      - memcompression
+      - esrv_svc
+      - jhi_service
+      - asus_framework
+      - asuscertservice
+      - intelcphdcpsvc
+      - nvidia overlay
+      - runtimebroker
+      - dataexchangehost
+      - shellexperiencehost
+      - useroobebroker
+      - sihost
+      - startmenuexperiencehost
+      - crossdeviceresume
+      - searchhost
+      - taskhostw
+      - acpowernotification
+      - armourysocketserver
+      - ctfmon
+      - tabtip
+      - 360desktoplite
+      - audiodg
+      - smartscreen
+    paths:
+      - windows\system32
+      - windows\syswow64
+      - program files\nvidia
+      - program files\intel
+      - program files\amd
+      - program files\asus
+    window_titles:
+      - "任务管理器"
+      - "File Explorer"
+      - "Command Prompt"
+      - "PowerShell"
+    company_keywords:
+      - microsoft
+      - nvidia
+      - intel
+      - amd
+      - asus
+
+  security:
+    description: "安全软件"
+    suggested_gpu: "integrated"
+    priority: "low"
+    base_score: 35
+    bonus_score: 0
+    keywords:
+      - antivirus
+      - defender
+      - 360
+      - security
+      - firewall
+      - malware
+      - norton
+      - mcafee
+      - kaspersky
+      - eset
+      - avg
+    paths:
+      - windows defender
+      - 360 security
+      - norton
+      - mcafee
+
+  utility:
+    description: "工具软件"
+    suggested_gpu: "integrated"
+    priority: "low"
+    base_score: 35
+    bonus_score: -5
+    keywords:
+      - utility
+      - tool
+      - helper
+      - manager
+      - optimizer
+      - cleaner
+      - ccleaner
+      - advanced systemcare
+      - driver
+      - update
+      - launcher
+      - installer
+      - updater
+      - service
+      - daemon
+      - agent
+      - tray
+      - widget
+      - gadget
+      - helper
+      - assistant
+      - accelerator
+      - enhancer
+      - monitor
+      - tracker
+      - recorder
+      - presentmon
+      - trae
+    paths:
+      - ccleaner
+      - advanced systemcare
+      - driver booster
+
+  communication:
+    description: "通讯软件"
+    suggested_gpu: "integrated"
+    priority: "low"
+    base_score: 35
+    bonus_score: 0
+    keywords:
+      - wechat
+      - qq
+      - telegram
+      - discord
+      - whatsapp
+      - signal
+      - line
+      - kakao
+      - skype
+      - messenger
+    paths:
+      - tencent\wechat
+      - tencent\qq
+      - telegram
+      - discord
+    window_titles:
+      - "微信"
+      - "QQ"
+      - "- Discord"
+      - "- Telegram"
+    company_keywords:
+      - tencent
+      - discord
+      - telegram
+
+  music:
+    description: "音乐软件"
+    suggested_gpu: "integrated"
+    priority: "low"
+    base_score: 35
+    bonus_score: 0
+    keywords:
+      - music
+      - player
+      - spotify
+      - netease
+      - kuwo
+      - kugou
+      - qqmusic
+      - itunes
+      - winamp
+    paths:
+      - netease cloud music
+      - qq music
+      - spotify
+    window_titles:
+      - "Spotify"
+      - "- QQ音乐"
+      - "- 网易云音乐"
+
+  cloud:
+    description: "云存储"
+    suggested_gpu: "integrated"
+    priority: "low"
+    base_score: 35
+    bonus_score: 0
+    keywords:
+      - dropbox
+      - onedrive
+      - google drive
+      - baidu
+      - aliyun
+      - weiyun
+      - icloud
+    paths:
+      - microsoft onedrive
+      - dropbox
+      - google drive
+
+priority_scoring:
+  cpu_weight: 25
+  memory_weight: 20
+  type_weight: 20
+  threads_weight: 10
+  io_weight: 10
+  system_load_weight: 10
+  age_weight: 5
+
+process_types:
+  user_app:
+    name: "用户应用"
+    score_bonus: 12
+  system:
+    name: "系统进程"
+    score_bonus: 8
+  service:
+    name: "服务进程"
+    score_bonus: 3
+  background:
+    name: "后台进程"
+    score_bonus: -5

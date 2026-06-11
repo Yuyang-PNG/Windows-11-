@@ -5,51 +5,569 @@ import time
 import threading
 from queue import Queue
 import glob
-from datetime import datetime
+from datetime import datetime, timedelta
 import json
+import yaml
+import logging
+from logging.handlers import RotatingFileHandler
+from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from functools import lru_cache, wraps
+from typing import Dict, Tuple, List, Optional, Any
 
-PRIORITY_LEVELS = {
-    'idle': psutil.IDLE_PRIORITY_CLASS,
-    'below_normal': psutil.BELOW_NORMAL_PRIORITY_CLASS,
-    'normal': psutil.NORMAL_PRIORITY_CLASS,
-    'above_normal': psutil.ABOVE_NORMAL_PRIORITY_CLASS,
-    'high': psutil.HIGH_PRIORITY_CLASS,
-    'realtime': psutil.REALTIME_PRIORITY_CLASS
+# ==================== 性能优化配置 ====================
+# 针对低性能用户的优化配置
+PERFORMANCE_MODE = os.environ.get('PRIORITY_MANAGER_PERF_MODE', 'balanced')  # 'fast', 'balanced', 'thorough'
+
+# 线程池配置 - 根据性能模式调整
+THREAD_POOL_SIZE = {
+    'fast': 2,
+    'balanced': 4,
+    'thorough': min(os.cpu_count() or 4, 8)
 }
 
-PRIORITY_DISPLAY = {
-    'idle': '空闲(I)',
-    'below_normal': '低于正常(B)',
-    'normal': '正常(N)',
-    'above_normal': '高于正常(A)',
-    'high': '高(H)',
-    'realtime': '实时(R)'
+# 扫描间隔配置（秒）
+SCAN_INTERVAL = {
+    'fast': 300,
+    'balanced': 180,
+    'thorough': 60
 }
 
-SYSTEM_PROCESSES = {'system', 'system idle process', 'smss.exe', 'csrss.exe', 
-                    'wininit.exe', 'services.exe', 'lsass.exe', 'svchost.exe',
-                    'fontdrvhost.exe', 'dwm.exe', 'taskhostw.exe', 'explorer.exe'}
-
-USER_APP_PROCESSES = {'chrome.exe', 'msedge.exe', 'firefox.exe', 'notepad.exe',
-                      'code.exe', 'visualstudio.exe', 'idea64.exe', 'pycharm.exe',
-                      'teams.exe', 'discord.exe', 'steam.exe', 'spotify.exe',
-                      'word.exe', 'excel.exe', 'powerpnt.exe', 'outlook.exe'}
-
-NEED_ADMIN_PROCESSES = {'smss.exe', 'csrss.exe', 'wininit.exe', 'services.exe', 
-                        'lsass.exe', 'system', 'system idle process'}
-
-PROTECTED_PROCESSES = {'dwm.exe', 'explorer.exe', 'csrss.exe', 'smss.exe', 
-                       'lsass.exe', 'system', 'system idle process'}
-
-THREAD_COUNT = 8
-LOG_FILE = 'process_priority_log.txt'
-CONFIG_FILE = 'gpu_config.json'
-
-GPU_PREFERENCES = {
-    'auto': '让 Windows 决定',
-    'integrated': '节能 (集成显卡)',
-    'discrete': '高性能 (独立显卡)'
+# 是否启用详细分析（影响CPU/内存）
+ENABLE_DETAILED_ANALYSIS = {
+    'fast': False,
+    'balanced': True,
+    'thorough': True
 }
+
+# 是否检测GPU（GPU检测可能耗时较长）
+ENABLE_GPU_DETECTION = {
+    'fast': False,
+    'balanced': True,
+    'thorough': True
+}
+
+def get_performance_mode():
+    """获取当前性能模式"""
+    return PERFORMANCE_MODE
+
+def get_thread_pool_size():
+    """根据性能模式获取线程池大小"""
+    return THREAD_POOL_SIZE.get(PERFORMANCE_MODE, 4)
+
+def should_enable_detailed_analysis():
+    """是否启用详细分析"""
+    return ENABLE_DETAILED_ANALYSIS.get(PERFORMANCE_MODE, True)
+
+def should_detect_gpu():
+    """是否检测GPU"""
+    return ENABLE_GPU_DETECTION.get(PERFORMANCE_MODE, True)
+
+# 系统托盘相关导入
+try:
+    import pystray
+    from PIL import Image, ImageDraw
+    TRAY_AVAILABLE = True
+except ImportError:
+    TRAY_AVAILABLE = False
+
+from core.constants import (
+    PRIORITY_LEVELS, PRIORITY_DISPLAY, SYSTEM_PROCESSES, USER_APP_PROCESSES,
+    NEED_ADMIN_PROCESSES, PROTECTED_PROCESSES, KNOWN_LIMITED_PROCESSES,
+    THREAD_COUNT, LOG_FILE, CONFIG_FILE, GPU_PREFERENCES, DEFAULT_WEIGHTS,
+    CATEGORY_BASE_SCORES, PROCESS_TYPE_BONUS, STATUS_SCORES
+)
+from core.classifier import AppClassifier
+from core.scorer import PriorityScorer
+from core.singleton import Singleton
+
+LOG_FORMAT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+
+class TTLCache:
+    def __init__(self, ttl_seconds=300):
+        self._cache = {}
+        self._ttl = ttl_seconds
+        self._lock = threading.RLock()
+    
+    def get(self, key):
+        with self._lock:
+            if key not in self._cache:
+                return None
+            data, timestamp = self._cache[key]
+            if time.time() - timestamp > self._ttl:
+                del self._cache[key]
+                return None
+            return data
+    
+    def set(self, key, value):
+        with self._lock:
+            self._cache[key] = (value, time.time())
+    
+    def invalidate(self, key=None):
+        with self._lock:
+            if key:
+                self._cache.pop(key, None)
+            else:
+                self._cache.clear()
+    
+    def __len__(self):
+        with self._lock:
+            return len(self._cache)
+
+GPU_CACHE = TTLCache(ttl_seconds=300)
+CLASSIFICATION_CACHE = TTLCache(ttl_seconds=600)
+
+def ttl_cache(ttl_seconds=300):
+    def decorator(func):
+        cache = TTLCache(ttl_seconds)
+        
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            key = (args, frozenset(kwargs.items()))
+            result = cache.get(key)
+            if result is not None:
+                return result
+            result = func(*args, **kwargs)
+            cache.set(key, result)
+            return result
+        return wrapper
+    return decorator
+
+def setup_logging(verbose=False):
+    """设置日志记录 - 用户模式下减少输出"""
+    logger = logging.getLogger('process_priority_manager')
+    
+    # 用户模式下只显示重要信息
+    if verbose:
+        logger.setLevel(logging.DEBUG)
+    else:
+        logger.setLevel(logging.ERROR)  # 用户模式：只显示错误
+    
+    # 清空已有的handler
+    if logger.handlers:
+        for handler in logger.handlers[:]:
+            logger.removeHandler(handler)
+    
+    formatter = logging.Formatter(LOG_FORMAT)
+    
+    console_handler = logging.StreamHandler()
+    if verbose:
+        console_handler.setLevel(logging.DEBUG)
+    else:
+        console_handler.setLevel(logging.ERROR)  # 用户模式：控制台只显示错误
+    console_handler.setFormatter(formatter)
+    
+    file_handler = RotatingFileHandler(
+        LOG_FILE,
+        maxBytes=5 * 1024 * 1024,
+        backupCount=3,
+        encoding='utf-8'
+    )
+    file_handler.setLevel(logging.WARNING)  # 文件记录警告和错误
+    file_handler.setFormatter(formatter)
+    
+    logger.addHandler(console_handler)
+    logger.addHandler(file_handler)
+    
+    return logger
+
+logger = setup_logging()
+
+class ProcessSnapshot:
+    def __init__(self, pid, name, create_time, cpu_percent, memory_percent):
+        self.pid = pid
+        self.name = name
+        self.create_time = create_time
+        self.cpu_percent = cpu_percent
+        self.memory_percent = memory_percent
+    
+    def __hash__(self):
+        return hash(self.pid)
+    
+    def __eq__(self, other):
+        if isinstance(other, ProcessSnapshot):
+            return self.pid == other.pid
+        return False
+    
+    def to_dict(self):
+        return {
+            'pid': self.pid,
+            'name': self.name,
+            'create_time': self.create_time,
+            'cpu_percent': self.cpu_percent,
+            'memory_percent': self.memory_percent
+        }
+
+class IncrementalScanner:
+    def __init__(self):
+        self.last_scan_time = 0
+        self.last_process_snapshots = set()
+        self.scan_interval = 5
+        self._lock = threading.RLock()
+    
+    def _get_process_snapshot(self, proc):
+        try:
+            create_time = proc.create_time()
+            cpu_percent = proc.cpu_percent(interval=None)
+            memory_percent = proc.memory_percent()
+            return ProcessSnapshot(
+                pid=proc.pid,
+                name=proc.name(),
+                create_time=create_time,
+                cpu_percent=cpu_percent,
+                memory_percent=memory_percent
+            )
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            return None
+    
+    def scan(self, force_full=False):
+        current_time = time.time()
+        
+        with self._lock:
+            if not force_full and current_time - self.last_scan_time < self.scan_interval:
+                logger.debug(f"跳过扫描，距离上次扫描仅 {current_time - self.last_scan_time:.1f}秒")
+                return [], [], []
+            
+            current_snapshots = set()
+            for proc in psutil.process_iter(['pid', 'name']):
+                snapshot = self._get_process_snapshot(proc)
+                if snapshot:
+                    current_snapshots.add(snapshot)
+            
+            new_processes = current_snapshots - self.last_process_snapshots
+            terminated_processes = self.last_process_snapshots - current_snapshots
+            
+            changed_processes = []
+            for current in current_snapshots:
+                for last in self.last_process_snapshots:
+                    if current.pid == last.pid:
+                        cpu_changed = abs(current.cpu_percent - last.cpu_percent) > 5
+                        mem_changed = abs(current.memory_percent - last.memory_percent) > 2
+                        if cpu_changed or mem_changed:
+                            changed_processes.append(current)
+                        break
+            
+            self.last_process_snapshots = current_snapshots
+            self.last_scan_time = current_time
+            
+            logger.info(f"增量扫描完成: 新增 {len(new_processes)} 个, 终止 {len(terminated_processes)} 个, 变化 {len(changed_processes)} 个")
+            
+            return list(new_processes), list(terminated_processes), list(changed_processes)
+    
+    def get_all_processes(self):
+        with self._lock:
+            return list(self.last_process_snapshots)
+    
+    def reset(self):
+        with self._lock:
+            self.last_scan_time = 0
+            self.last_process_snapshots = set()
+
+class Application(metaclass=Singleton):
+    def __init__(self):
+        self._initialized = False
+    
+    def initialize(self):
+        if self._initialized:
+            return
+        
+        self.config_manager = None
+        self.history_manager = None
+        self.perf_counter = None
+        self.network_monitor = None
+        self.ml_model = None
+        self.smart_classifier = None
+        self.api_server = None
+        self.incremental_scanner = IncrementalScanner()
+        self.scheduler = None
+        
+        try:
+            from config.config_manager import ConfigManager
+            self.config_manager = ConfigManager()
+            logger.info("配置模块加载成功")
+        except ImportError as e:
+            logger.warning(f"配置模块不可用: {e}")
+        
+        try:
+            from monitoring.history_manager import HistoryManager
+            self.history_manager = HistoryManager()
+            logger.info("历史记录模块加载成功")
+        except ImportError as e:
+            logger.warning(f"历史记录模块不可用: {e}")
+        
+        try:
+            from monitoring.performance_counter import PerformanceCounter
+            self.perf_counter = PerformanceCounter()
+            logger.info("性能计数器模块加载成功")
+        except ImportError as e:
+            logger.warning(f"性能计数器模块不可用: {e}")
+        
+        try:
+            from monitoring.network_monitor import NetworkMonitor
+            self.network_monitor = NetworkMonitor()
+            logger.info("网络监控模块加载成功")
+        except ImportError as e:
+            logger.warning(f"网络监控模块不可用: {e}")
+        
+        try:
+            from ml.scoring_model import MLScoringModel
+            self.ml_model = MLScoringModel()
+            logger.info("ML评分模型加载成功")
+        except ImportError as e:
+            logger.warning(f"ML评分模型不可用，使用规则引擎评分: {e}")
+        
+        try:
+            from ml.smart_classifier import SmartAppClassifier
+            self.smart_classifier = SmartAppClassifier()
+            if self.config_manager:
+                categories = self.config_manager.get_app_categories().get('categories', APP_CATEGORIES)
+                result = self.smart_classifier.train(categories)
+                if result['status'] == 'success':
+                    logger.info(f"智能分类器训练成功，样本数: {result['samples']}")
+                else:
+                    logger.warning(f"智能分类器训练失败: {result.get('message', '未知错误')}")
+            logger.info("智能分类器模块加载成功")
+        except ImportError as e:
+            logger.warning(f"智能分类器模块不可用: {e}")
+        
+        self._initialized = True
+        
+        global CONFIG_MANAGER, ML_MODEL, HISTORY_MANAGER, PERF_COUNTER, NETWORK_MONITOR
+        CONFIG_MANAGER = self.config_manager
+        ML_MODEL = self.ml_model
+        HISTORY_MANAGER = self.history_manager
+        PERF_COUNTER = self.perf_counter
+        NETWORK_MONITOR = self.network_monitor
+        
+        # 初始化游戏检测状态
+        self.game_detection_enabled = True  # 游戏检测开关
+        self.last_game_optimization = 0    # 上次游戏优化时间
+        self.game_cooldown = 300           # 游戏优化冷却时间（秒）- 默认5分钟
+        self.last_detected_games = set()  # 上次检测到的游戏
+        self.game_optimization_count = 0   # 游戏优化次数统计
+    
+    def detect_games(self):
+        """
+        检测当前运行的游戏进程
+        返回: (是否有游戏运行, 游戏列表)
+        """
+        if not self.game_detection_enabled:
+            return False, []
+        
+        try:
+            current_games = set()
+            gaming_category = APP_CATEGORIES.get('gaming', {})
+            game_keywords = gaming_category.get('keywords', [])
+            
+            for proc in psutil.process_iter(['pid', 'name', 'exe']):
+                try:
+                    proc_name = proc.name().lower()
+                    proc_exe = ''
+                    try:
+                        proc_exe = proc.exe().lower() if proc.exe() else ''
+                    except:
+                        pass
+                    
+                    # 检查进程名和路径是否包含游戏关键词
+                    for keyword in game_keywords:
+                        if keyword in proc_name or keyword in proc_exe:
+                            current_games.add(proc_name)
+                            break
+                            
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+            
+            # 检查是否有新游戏启动
+            new_games = current_games - self.last_detected_games
+            
+            if new_games and self.last_detected_games:
+                logger.info(f"检测到新游戏启动: {', '.join(new_games)}")
+            
+            self.last_detected_games = current_games
+            return len(current_games) > 0, list(current_games)
+            
+        except Exception as e:
+            logger.debug(f"游戏检测失败: {e}")
+            return False, []
+    
+    def should_optimize_for_games(self):
+        """
+        判断是否应该执行游戏优化
+        基于冷却时间和游戏状态
+        """
+        current_time = time.time()
+        
+        # 检查冷却时间
+        if current_time - self.last_game_optimization < self.game_cooldown:
+            logger.debug(f"游戏优化冷却中，还需 {int(self.game_cooldown - (current_time - self.last_game_optimization))} 秒")
+            return False
+        
+        # 检查是否有游戏在运行
+        has_games, game_list = self.detect_games()
+        return has_games
+    
+    def optimize_for_games(self):
+        """
+        针对游戏进行进程优化
+        使用轻量级快速模式
+        """
+        current_time = time.time()
+        
+        # 检查是否应该优化
+        if not self.should_optimize_for_games():
+            return None
+        
+        logger.info("开始游戏优化...")
+        self.game_optimization_count += 1
+        
+        try:
+            # 使用快速模式进行分析（减少资源占用）
+            global PERFORMANCE_MODE
+            original_mode = PERFORMANCE_MODE
+            PERFORMANCE_MODE = 'fast'  # 使用快速模式避免影响游戏
+            
+            # 临时修改全局函数使用快速模式
+            results = analyze_all_processes()
+            
+            PERFORMANCE_MODE = original_mode  # 恢复原模式
+            
+            success_count = sum(1 for r in results if r.get('status') == 'success')
+            
+            # 统计优化结果
+            optimized_games = [r for r in results if r.get('proc_type') == 'game']
+            optimized_others = [r for r in results if r.get('proc_type') != 'game']
+            
+            self.last_game_optimization = current_time
+            
+            logger.info(f"游戏优化完成: 优化 {success_count} 个进程, "
+                       f"其中游戏进程 {len(optimized_games)} 个, "
+                       f"其他进程 {len(optimized_others)} 个, "
+                       f"本次为第 {self.game_optimization_count} 次优化")
+            
+            return {
+                'success': success_count,
+                'games': len(optimized_games),
+                'others': len(optimized_others),
+                'total': len(results)
+            }
+            
+        except Exception as e:
+            logger.error(f"游戏优化失败: {e}")
+            return None
+    
+    def start_scheduler(self):
+        try:
+            from apscheduler.schedulers.background import BackgroundScheduler
+            from apscheduler.triggers.interval import IntervalTrigger
+            
+            self.scheduler = BackgroundScheduler()
+            
+            # 游戏检测和优化任务 - 每30秒检测一次
+            self.scheduler.add_job(
+                self._smart_optimization,
+                trigger=IntervalTrigger(seconds=30),
+                id='smart_optimization',
+                name='智能游戏优化',
+                replace_existing=True
+            )
+            
+            # 定期快照任务 - 每5分钟
+            self.scheduler.add_job(
+                self._scheduled_snapshot,
+                trigger=IntervalTrigger(minutes=5),
+                id='periodic_snapshot',
+                name='定期进程快照',
+                replace_existing=True
+            )
+            
+            # 每日清理任务
+            self.scheduler.add_job(
+                self._cleanup_old_data,
+                trigger=IntervalTrigger(hours=24),
+                id='daily_cleanup',
+                name='每日清理',
+                replace_existing=True
+            )
+            
+            self.scheduler.start()
+            logger.info("定时任务调度器启动成功 - 智能游戏检测已启用")
+        except ImportError as e:
+            logger.warning(f"APScheduler不可用，定时任务功能已禁用: {e}")
+    
+    def _smart_optimization(self):
+        """
+        智能优化任务
+        检测到游戏时自动优化，不频繁打扰
+        """
+        try:
+            # 检测游戏
+            has_games, game_list = self.detect_games()
+            
+            if has_games:
+                logger.debug(f"检测到游戏运行: {', '.join(game_list)}")
+                
+                # 如果有游戏，尝试优化
+                result = self.optimize_for_games()
+                if result:
+                    logger.info(f"游戏 '{game_list[0]}' 优化完成")
+            else:
+                logger.debug("当前无游戏运行")
+                
+        except Exception as e:
+            logger.debug(f"智能优化任务执行失败: {e}")
+    
+    def _scheduled_optimization(self):
+        logger.info("执行定时自动优化任务")
+        try:
+            results = analyze_all_processes()
+            success_count = sum(1 for r in results if r.get('status') == 'success')
+            logger.info(f"定时优化完成: 成功 {success_count} 个进程")
+        except Exception as e:
+            logger.error(f"定时优化任务失败: {e}")
+    
+    def _scheduled_snapshot(self):
+        try:
+            if self.history_manager:
+                processes = get_process_list_for_snapshot()
+                self.history_manager.record_process_snapshot(processes)
+                logger.debug("定期快照已记录")
+        except Exception as e:
+            logger.error(f"定期快照任务失败: {e}")
+    
+    def _cleanup_old_data(self):
+        try:
+            if self.history_manager:
+                self.history_manager.clean_old_data()
+                logger.info("旧数据清理完成")
+        except Exception as e:
+            logger.error(f"数据清理任务失败: {e}")
+    
+    def shutdown(self):
+        if self.scheduler:
+            self.scheduler.shutdown(wait=False)
+            logger.info("定时任务调度器已停止")
+
+APP = Application()
+
+CONFIG_MANAGER = None
+ML_MODEL = None
+HISTORY_MANAGER = None
+PERF_COUNTER = None
+NETWORK_MONITOR = None
+
+try:
+    from api.app import ProcessPriorityAPI
+    API_AVAILABLE = True
+    logger.info("API模块加载成功")
+except ImportError as e:
+    API_AVAILABLE = False
+    logger.warning(f"API模块不可用: {e}")
+
+try:
+    from flask import Flask, render_template_string, request, jsonify
+    FLASK_AVAILABLE = True
+except ImportError:
+    FLASK_AVAILABLE = False
 
 APP_CATEGORIES = {
     'gaming': {
@@ -69,6 +587,7 @@ APP_CATEGORIES = {
                      'borderlands', 'mass effect', 'dragon age', 'final fantasy',
                      'kingdom hearts', 'zelda', 'mario', 'pokemon', 'animal crossing',
                      'gameviewer', 'platformprocess', 'pcgameplatform', 'gameservice',
+                     '七日世界', 'sevenworld',
                      'fevergames', 'security_protection', 'game_security', 'gamelauncher',
                      'unity', 'unreal', 'ue4', 'ue5', 'cryengine', 'source'],
         'paths': ['steam\\steamapps', 'epic games', 'battle.net', 'origin games',
@@ -92,11 +611,12 @@ APP_CATEGORIES = {
         'priority': 'medium'
     },
     'browser': {
-        'keywords': ['browser', 'chrome', 'edge', 'firefox', 'brave', 'opera', 'safari',
-                     'cent', 'maxthon'],
+        'keywords': ['browser', 'chrome', 'edge', 'msedge', 'firefox', 'brave', 'opera', 'safari',
+                     'cent', 'maxthon', 'chromium', 'vivaldi', 'yandex', 'torbrowser'],
         'paths': ['google\\chrome', 'microsoft\\edge', 'mozilla\\firefox',
-                  'brave software', 'opera software'],
-        'window_titles': ['- Google Chrome', '- Microsoft Edge', '- Mozilla Firefox'],
+                  'brave software', 'opera software', 'vivaldi'],
+        'window_titles': ['- Google Chrome', '- Microsoft Edge', '- Mozilla Firefox',
+                         '- Brave', '- Opera', '- Vivaldi'],
         'description': '浏览器',
         'suggested_gpu': 'integrated',
         'priority': 'low'
@@ -145,8 +665,28 @@ APP_CATEGORIES = {
     },
     'system': {
         'keywords': ['svchost', 'explorer', 'taskmgr', 'dwm', 'services', 'lsass',
-                     'smss', 'csrss', 'wininit', 'winlogon', 'rundll32', 'cmd', 'powershell'],
-        'paths': ['windows\\system32', 'windows\\syswow64'],
+                     'smss', 'csrss', 'wininit', 'winlogon', 'rundll32', 'cmd', 'powershell',
+                     'system', 'conhost', 'wuahost', 'wudfhost', 'fontdrvhost', 'armsvc',
+                     'mssense', 'mpsvc', 'msmpeng', 'searchindexer', 'searchfilterhost',
+                     'searchprotocolhost', 'wmiprvse', 'wmiapsrv', 'unsecapp', 'spoolsv',
+                     'nvcontainer', 'nvidia', 'intel', 'amd', 'realtek', 'asus', 'armourycrate',
+                     'rogliveservice', 'esrv', 'crashpad_handler', 'msedgeupdate',
+                     'textinputhost', 'applicationframehost', 'aggregatorhost', 'shellhost',
+                     'wlanext', 'chsime', 'sursvc', 'ipfsvc', 'dsaservice', 'asusswitch',
+                     'asusoptimization', 'asusappservice', 'asussoftwaremanager', 'asusptpservice',
+                     'asussystemdiagnosis', 'asussystemanalysis', 'hipsdaemon', 'dax3api',
+                     'mpdefendercoreservice', 'rtkauduservice', 'intelaudioservice', 'intelgraphicsoftware',
+                     'intel_pie_service', 'presentmonservice', 'wmiregistrationservice', 'dsaupdateservice',
+                     'wsctrlsvc', 'gameviewerserver', 'gameviewerservice', 'trae', 'python',
+                     'memcompression', 'nvdisplay.container', 'esrv_svc', 'jhi_service',
+                     'asus_framework', 'asussoftwaresourcemanageragent', 'asuscertservice',
+                     'intelcphdcpsvc', 'nvidia overlay', 'runtimebroker', 'dataexchangehost',
+                     'shellexperiencehost', 'useroobebroker', 'sihost', 'startmenuexperiencehost',
+                     'crossdeviceresume', 'searchhost', 'taskhostw', 'acpowernotification',
+                     'armourysocketserver', 'ctfmon', 'tabtip', '360desktoplite', 'audiodg',
+                     'smartscreen', 'armourycrate.usersessionhelper'],
+        'paths': ['windows\\system32', 'windows\\syswow64', 'program files\\nvidia',
+                  'program files\\intel', 'program files\\amd', 'program files\\asus'],
         'window_titles': ['任务管理器', 'File Explorer', 'Command Prompt', 'PowerShell'],
         'description': '系统进程',
         'suggested_gpu': 'integrated',
@@ -228,62 +768,20 @@ def get_process_company_name(exe_path):
     except:
         return None
 
-def classify_app(process_name, exe_path=None, window_title=None, company_name=None):
-    name_lower = process_name.lower()
-    path_lower = exe_path.lower() if exe_path else ""
-    title_lower = window_title.lower() if window_title else ""
-    company_lower = company_name.lower() if company_name else ""
-    
-    matched_categories = []
-    
-    for category, info in APP_CATEGORIES.items():
-        score = 0
-        
-        for keyword in info.get('keywords', []):
-            if keyword in name_lower:
-                score += 10
-        
-        for path_keyword in info.get('paths', []):
-            if path_keyword in path_lower:
-                score += 8
-        
-        for title_keyword in info.get('window_titles', []):
-            if title_keyword.lower() in title_lower:
-                score += 12
-        
-        company_keywords = {
-            'gaming': ['valve', 'riot', 'blizzard', 'epic', 'rockstar', 'ubisoft', 'ea', 'nintendo'],
-            'browser': ['google', 'microsoft', 'mozilla', 'opera', 'brave'],
-            'productivity': ['microsoft', 'kingsoft', 'wps'],
-            'design': ['adobe', 'autodesk', 'maxon'],
-            'system': ['microsoft'],
-            'communication': ['tencent', 'discord', 'telegram']
-        }
-        
-        if category in company_keywords:
-            for company_keyword in company_keywords[category]:
-                if company_keyword in company_lower:
-                    score += 15
-        
-        if score > 0:
-            matched_categories.append((category, score, info))
-    
-    if matched_categories:
-        matched_categories.sort(key=lambda x: x[1], reverse=True)
-        top_category = matched_categories[0]
-        return top_category[0], top_category[2]
-    
-    if exe_path:
-        if '\\games\\' in path_lower or '\\steamapps\\' in path_lower:
-            return 'gaming', APP_CATEGORIES['gaming']
-        if '\\adobe\\' in path_lower:
-            return 'design', APP_CATEGORIES['design']
-        if '\\microsoft office\\' in path_lower:
-            return 'productivity', APP_CATEGORIES['productivity']
-        if '\\windows\\' in path_lower:
-            return 'system', APP_CATEGORIES['system']
-    
-    return 'unknown', {'description': '未知应用', 'suggested_gpu': 'auto', 'priority': 'medium'}
+_classifier = None
+
+def get_classifier():
+    global _classifier
+    if _classifier is None:
+        _classifier = AppClassifier()
+    return _classifier
+
+def classify_app(process_name: str, exe_path: Optional[str] = None, window_title: Optional[str] = None, 
+                 company_name: Optional[str] = None, use_smart: bool = True) -> Tuple[str, Dict]:
+    return get_classifier().classify(process_name, exe_path, window_title, company_name, use_smart)
+
+def classify_process(process_name_lower: str) -> str:
+    return classify_app(process_name_lower)[0]
 
 def ai_gpu_recommendation(process_name, gpus):
     category, info = classify_app(process_name)
@@ -409,68 +907,81 @@ def detect_gpu_brand(name):
     else:
         return {'brand': 'Unknown', 'brand_name': '未知', 'color': '灰色', 'is_discrete': False}
 
-def get_gpu_info():
+def _detect_nvidia_gpus(existing_names):
     gpus = []
-    detected_gpus = set()
-    
     try:
         import subprocess
-        result = subprocess.run(['nvidia-smi', '--query-gpu=name,memory.total,memory.used,utilization.gpu', '--format=csv,noheader,nounits'], 
-                               capture_output=True, text=True, timeout=5)
+        result = subprocess.run(
+            ['nvidia-smi', '--query-gpu=name,memory.total,memory.used,utilization.gpu', 
+             '--format=csv,noheader,nounits'],
+            capture_output=True, text=True, timeout=5
+        )
         if result.returncode == 0:
-            lines = result.stdout.strip().split('\n')
-            for line in lines:
+            for line in result.stdout.strip().split('\n'):
                 parts = line.split(',')
                 if len(parts) >= 4:
                     gpu_name = parts[0].strip()
-                    if gpu_name not in detected_gpus:
-                        detected_gpus.add(gpu_name)
-                        brand_info = detect_gpu_brand(gpu_name)
+                    if gpu_name not in existing_names:
                         gpus.append({
                             'name': gpu_name,
                             'memory_total': int(parts[1].strip()),
                             'memory_used': int(parts[2].strip()),
                             'utilization': int(parts[3].strip()),
                             'type': 'discrete',
-                            **brand_info
+                            **detect_gpu_brand(gpu_name)
                         })
-    except:
-        pass
-    
+        logger.debug(f"NVIDIA检测完成，找到 {len(gpus)} 个GPU")
+    except Exception as e:
+        logger.debug(f"NVIDIA检测失败: {e}")
+    return gpus
+
+def _detect_amd_gpus(existing_names):
+    gpus = []
     try:
-        result = subprocess.run(['amdgpu-info', '--json'], capture_output=True, text=True, timeout=5)
+        import subprocess
+        result = subprocess.run(
+            ['powershell', '-Command', 
+             'Get-CimInstance -ClassName Win32_VideoController | Select-Object Name,AdapterRAM | ConvertTo-Json'],
+            capture_output=True, text=True, timeout=10
+        )
         if result.returncode == 0:
             import json
-            data = json.loads(result.stdout)
-            for gpu in data.get('amdgpu', []):
-                gpu_name = gpu.get('name', 'Unknown AMD GPU')
-                if gpu_name not in detected_gpus:
-                    detected_gpus.add(gpu_name)
-                    brand_info = detect_gpu_brand(gpu_name)
-                    gpus.append({
-                        'name': gpu_name,
-                        'memory_total': int(gpu.get('memory_total', 0)),
-                        'memory_used': int(gpu.get('memory_used', 0)),
-                        'utilization': int(gpu.get('utilization', 0)),
-                        'type': 'discrete',
-                        **brand_info
-                    })
-    except:
-        pass
-    
+            try:
+                data = json.loads(result.stdout)
+                if isinstance(data, dict):
+                    data = [data]
+                for adapter in data:
+                    gpu_name = adapter.get('Name', 'Unknown GPU')
+                    if 'AMD' in gpu_name.upper() or 'RADEON' in gpu_name.upper():
+                        if gpu_name not in existing_names:
+                            vram = int(adapter.get('AdapterRAM', 0)) // (1024 ** 2) if adapter.get('AdapterRAM') else 0
+                            gpus.append({
+                                'name': gpu_name,
+                                'memory_total': vram,
+                                'memory_used': 0,
+                                'utilization': 0,
+                                'type': 'discrete',
+                                **detect_gpu_brand(gpu_name)
+                            })
+            except json.JSONDecodeError:
+                pass
+        logger.debug(f"AMD检测完成，找到 {len(gpus)} 个GPU")
+    except Exception as e:
+        logger.debug(f"AMD检测失败: {e}")
+    return gpus
+
+def _detect_wmi_gpus(existing_names):
+    gpus = []
     try:
         import wmi
         c = wmi.WMI()
         for adapter in c.Win32_VideoController():
             gpu_name = adapter.Name
-            if gpu_name not in detected_gpus:
-                detected_gpus.add(gpu_name)
+            if gpu_name not in existing_names:
                 brand_info = detect_gpu_brand(gpu_name)
                 vram = int(adapter.AdapterRAM) // (1024 ** 2) if adapter.AdapterRAM else 0
                 
-                if brand_info.get('is_discrete'):
-                    gpu_type = 'discrete'
-                elif 'Intel Arc' in gpu_name:
+                if brand_info.get('is_discrete') or 'Intel Arc' in gpu_name:
                     gpu_type = 'discrete'
                 elif 'Intel' in gpu_name or 'UHD' in gpu_name or 'HD Graphics' in gpu_name:
                     gpu_type = 'integrated'
@@ -485,12 +996,37 @@ def get_gpu_info():
                     'type': gpu_type,
                     **brand_info
                 })
-    except:
-        pass
+        logger.debug(f"WMI检测完成，找到 {len(gpus)} 个GPU")
+    except ImportError:
+        logger.debug(f"WMI检测跳过: wmi模块未安装")
+    except Exception as e:
+        logger.debug(f"WMI检测失败: {e}")
+    return gpus
+
+def get_gpu_info(force_refresh=False):
+    if not force_refresh:
+        cached = GPU_CACHE.get('gpu_info')
+        if cached is not None:
+            logger.debug("使用缓存的GPU信息")
+            return cached
+    
+    gpus = []
+    detected_names = set()
+    
+    detectors = [_detect_nvidia_gpus, _detect_amd_gpus, _detect_wmi_gpus]
+    
+    for detector in detectors:
+        new_gpus = detector(detected_names)
+        for gpu in new_gpus:
+            if gpu['name'] not in detected_names:
+                detected_names.add(gpu['name'])
+                gpus.append(gpu)
     
     for i, gpu in enumerate(gpus):
         gpu['index'] = i
     
+    GPU_CACHE.set('gpu_info', gpus)
+    logger.info(f"GPU检测完成，共找到 {len(gpus)} 个GPU")
     return gpus
 
 def get_gpu_settings_from_registry():
@@ -545,24 +1081,38 @@ def set_gpu_preference(exe_path, preference):
         print(f"修改GPU设置失败: {e}")
         return False
 
-def get_system_metrics():
-    cpu_percent = psutil.cpu_percent(interval=0.01)
+def get_system_metrics(skip_gpu=False):
+    """获取系统指标，支持跳过GPU检测以提高性能"""
+    # 快速获取CPU百分比（非阻塞模式）
+    cpu_percent = psutil.cpu_percent(interval=None)
     memory = psutil.virtual_memory()
     disk = psutil.disk_usage('/')
-    gpus = get_gpu_info()
     
-    disk_partitions = []
-    for part in psutil.disk_partitions(all=False):
+    # 根据性能模式决定是否检测GPU
+    gpus = []
+    if not skip_gpu and should_detect_gpu():
         try:
-            usage = psutil.disk_usage(part.mountpoint)
-            disk_partitions.append({
-                'device': part.device,
-                'mountpoint': part.mountpoint,
-                'percent': usage.percent,
-                'free': usage.free / (1024 ** 3)
-            })
-        except:
-            pass
+            gpus = get_gpu_info()
+        except Exception as e:
+            logger.debug(f"GPU检测失败（性能优化跳过）: {e}")
+            gpus = []
+    
+    # 磁盘分区信息（简化获取，减少IO操作）
+    disk_partitions = []
+    try:
+        for part in psutil.disk_partitions(all=False):
+            try:
+                usage = psutil.disk_usage(part.mountpoint)
+                disk_partitions.append({
+                    'device': part.device,
+                    'mountpoint': part.mountpoint,
+                    'percent': usage.percent,
+                    'free': usage.free / (1024 ** 3)
+                })
+            except Exception:
+                pass
+    except Exception:
+        pass
     
     return {
         'cpu_percent': cpu_percent,
@@ -575,93 +1125,103 @@ def get_system_metrics():
         'disk_partitions': disk_partitions
     }
 
-def classify_process(process_name_lower):
-    if process_name_lower in SYSTEM_PROCESSES:
-        return 'system'
-    if process_name_lower in USER_APP_PROCESSES:
-        return 'user_app'
-    if 'service' in process_name_lower or 'svc' in process_name_lower:
-        return 'service'
-    if 'background' in process_name_lower or 'daemon' in process_name_lower:
-        return 'background'
-    return 'unknown'
-
 def need_admin(process_name_lower):
     return process_name_lower in NEED_ADMIN_PROCESSES
 
 def is_protected(process_name_lower):
     return process_name_lower in PROTECTED_PROCESSES
 
-def score_to_priority(score):
-    if score >= 85:
-        return 'high', PRIORITY_DISPLAY['high']
-    elif score >= 70:
-        return 'above_normal', PRIORITY_DISPLAY['above_normal']
-    elif score >= 45:
-        return 'normal', PRIORITY_DISPLAY['normal']
-    elif score >= 25:
-        return 'below_normal', PRIORITY_DISPLAY['below_normal']
-    else:
-        return 'idle', PRIORITY_DISPLAY['idle']
+_scorer = None
 
-def get_priority_key(priority_value):
-    for key, value in PRIORITY_LEVELS.items():
-        if value == priority_value:
-            return key
-    return 'normal'
+def get_scorer():
+    global _scorer
+    if _scorer is None:
+        _scorer = PriorityScorer()
+    return _scorer
+
+def score_to_priority(score: float) -> Tuple[str, str]:
+    return get_scorer().score_to_priority(score)
+
+def get_priority_key(priority_value: int) -> str:
+    return get_scorer().get_priority_key(priority_value)
 
 def calculate_priority_score(process, system_metrics, config):
+    """计算进程优先级分数，支持性能优化模式"""
     try:
+        # 基础指标获取（这些是必须的）
         cpu_percent = process.cpu_percent(interval=None)
         if cpu_percent > 100:
             cpu_percent = 50
         
         memory_percent = process.memory_percent()
+        process_name = process.name().lower()
         
-        try:
-            memory_info = process.memory_info()
-            memory_rss = memory_info.rss / (1024 ** 2)
-            memory_vms = memory_info.vms / (1024 ** 2)
-        except:
-            memory_rss = 0
-            memory_vms = 0
+        # 根据性能模式决定是否获取详细信息
+        enable_detailed = should_enable_detailed_analysis()
         
-        try:
-            io_counters = process.io_counters()
-            io_read = io_counters.read_bytes / (1024 ** 2)
-            io_write = io_counters.write_bytes / (1024 ** 2)
-        except:
-            io_read = 0
-            io_write = 0
+        # 内存信息（快速模式下跳过详细内存信息）
+        memory_rss = 0
+        memory_vms = 0
+        if enable_detailed:
+            try:
+                memory_info = process.memory_info()
+                memory_rss = memory_info.rss / (1024 ** 2)
+                memory_vms = memory_info.vms / (1024 ** 2)
+            except:
+                pass
         
+        # IO计数器（快速模式下跳过，IO操作相对耗时）
+        io_read = 0
+        io_write = 0
+        if enable_detailed:
+            try:
+                io_counters = process.io_counters()
+                io_read = io_counters.read_bytes / (1024 ** 2)
+                io_write = io_counters.write_bytes / (1024 ** 2)
+            except:
+                pass
+        
+        # 线程数
         try:
             num_threads = process.num_threads()
         except:
             num_threads = 1
         
-        try:
-            create_time = process.create_time()
-            uptime = time.time() - create_time
-        except:
-            uptime = 3600
+        # 进程运行时间（快速模式下跳过）
+        uptime = 3600  # 默认值
+        if enable_detailed:
+            try:
+                create_time = process.create_time()
+                uptime = time.time() - create_time
+            except:
+                pass
         
-        try:
-            status = process.status()
-        except:
-            status = 'running'
+        # 进程状态（快速模式下跳过）
+        status = 'running'
+        if enable_detailed:
+            try:
+                status = process.status()
+            except:
+                pass
         
-        process_name = process.name().lower()
+        # 进程类型分类（使用缓存）
         proc_type = classify_process(process_name)
         
+        # 可执行文件路径
         exe_path = ""
         try:
             exe_path = process.exe()
         except:
             pass
         
-        window_title = get_process_window_title(process.pid)
-        company_name = get_process_company_name(exe_path) if exe_path else None
+        # 窗口标题和公司名称（快速模式下跳过）
+        window_title = None
+        company_name = None
+        if enable_detailed:
+            window_title = get_process_window_title(process.pid)
+            company_name = get_process_company_name(exe_path) if exe_path else None
         
+        # 应用分类（使用缓存）
         category, cat_info = classify_app(process.name(), exe_path, window_title, company_name)
         
         metrics = {
@@ -685,111 +1245,198 @@ def calculate_priority_score(process, system_metrics, config):
             'memory_vms': memory_vms,
             'io_read': io_read,
             'io_write': io_write,
-            'num_threads': num_threads,
-            **details
+            'num_threads': num_threads,** details
         }
     except (psutil.AccessDenied, psutil.NoSuchProcess):
         return None, None, None, None, None
 
-def cross_analysis_scoring(metrics, system_metrics, config):
+def evaluate_condition(condition, metrics):
+    field = condition.get('field')
+    operator = condition.get('operator')
+    value = condition.get('value')
+    
+    field_value = metrics.get(field, 0)
+    
+    if operator == '>':
+        return field_value > value
+    elif operator == '<':
+        return field_value < value
+    elif operator == '>=':
+        return field_value >= value
+    elif operator == '<=':
+        return field_value <= value
+    elif operator == '==':
+        return field_value == value
+    elif operator == '!=':
+        return field_value != value
+    
+    return False
+
+def cross_analysis_scoring(metrics, system_metrics, config, use_ml=False):
     scores = {}
     details = {}
     
-    scores['category_base'] = {
-        'gaming': 75,
-        'design': 65,
-        'ai': 65,
-        'video': 55,
-        'development': 55,
-        'browser': 45,
-        'productivity': 45,
-        'security': 40,
-        'utility': 40,
-        'system': 50,
-        'unknown': 45
-    }[metrics['category']]
+    if use_ml and ML_MODEL:
+        ml_score = ML_MODEL.predict_score(metrics)
+        details['scoring_method'] = 'ml'
+        return ml_score, details
     
-    cpu_score = min(25, metrics['cpu'] * 0.5)
-    scores['cpu'] = cpu_score
+    weights = {
+        'cpu_weight': 25,
+        'memory_weight': 20,
+        'threads_weight': 10,
+        'io_weight': 8,
+        'uptime_weight': 7,
+        'status_weight': 5,
+        'type_weight': 15
+    }
     
-    memory_score = min(20, metrics['memory'] * 0.4)
-    scores['memory'] = memory_score
+    category_base_scores = {
+        'gaming': 75, 'video': 55, 'browser': 45, 'productivity': 45,
+        'development': 55, 'design': 65, 'ai': 65, 'system': 50,
+        'security': 40, 'utility': 40, 'communication': 42,
+        'music': 42, 'cloud': 40, 'unknown': 45
+    }
     
-    thread_score = min(10, min(metrics['threads'], 50) * 0.2)
-    scores['threads'] = thread_score
+    type_bonus_map = {
+        'user_app': 8, 'system': 5, 'service': 2, 'background': -5, 'unknown': 0
+    }
     
-    io_score = min(8, metrics['io'])
-    scores['io'] = io_score
+    status_scores = {
+        'running': 5, 'sleeping': -3, 'waiting': -2, 'stopped': -10, 'zombie': -15
+    }
     
-    uptime_score = 0
-    if metrics['uptime'] < 300:
-        uptime_score = 8
-    elif metrics['uptime'] < 1800:
-        uptime_score = 4
-    elif metrics['uptime'] > 86400:
-        uptime_score = -5
+    if CONFIG_MANAGER:
+        try:
+            rules = CONFIG_MANAGER.get_scoring_rules()
+            weights = rules.get('weights', weights)
+            category_base_scores = rules.get('category_base_scores', category_base_scores)
+            type_bonus_map = rules.get('process_type_bonus', type_bonus_map)
+            status_scores = rules.get('status_scores', status_scores)
+        except Exception as e:
+            print(f"加载评分规则失败: {e}")
+    
+    scores['category_base'] = category_base_scores.get(metrics['category'], 45)
+    
+    cpu_weight = weights.get('cpu_weight', 25)
+    scores['cpu'] = min(cpu_weight, metrics['cpu'] * (cpu_weight / 20))
+    
+    memory_weight = weights.get('memory_weight', 20)
+    scores['memory'] = min(memory_weight, metrics['memory'] * (memory_weight / 25))
+    
+    threads_weight = weights.get('threads_weight', 10)
+    scores['threads'] = min(threads_weight, min(metrics['threads'], 50) * (threads_weight / 50))
+    
+    io_weight = weights.get('io_weight', 8)
+    scores['io'] = min(io_weight, metrics['io'])
+    
+    uptime_weight = weights.get('uptime_weight', 7)
+    uptime_score = CONFIG_MANAGER.calculate_uptime_score(metrics['uptime']) if CONFIG_MANAGER else 0
     scores['uptime'] = uptime_score
     
-    status_score = 0
-    if metrics['status'] == 'running':
-        status_score = 5
-    elif metrics['status'] == 'sleeping':
-        status_score = -3
+    status_weight = weights.get('status_weight', 5)
+    status_score = status_scores.get(metrics['status'], 0) * (status_weight / 5)
     scores['status'] = status_score
     
-    type_bonus = {
-        'system': 5,
-        'user_app': 8,
-        'service': 2,
-        'background': -5,
-        'unknown': 0
-    }[metrics['proc_type']]
+    type_weight = weights.get('type_weight', 15)
+    type_bonus = type_bonus_map.get(metrics['proc_type'], 0) * (type_weight / 8)
     scores['type'] = type_bonus
     
     base_score = sum(scores.values())
     
     cross_factors = []
     
-    if metrics['category'] == 'gaming':
-        if metrics['cpu'] > 30 or metrics['memory'] > 15:
-            cross_factors.append(('gaming_active', 10))
-        if metrics['threads'] > 30:
-            cross_factors.append(('gaming_threads', 5))
+    if CONFIG_MANAGER:
+        try:
+            cross_config = CONFIG_MANAGER.get_cross_factors()
+            for factor in cross_config.get('factors', []):
+                category = factor.get('category')
+                conditions = factor.get('conditions', [])
+                logic = factor.get('logic', 'AND')
+                score_bonus = factor.get('score_bonus', 0)
+                
+                category_match = False
+                if category == '*':
+                    category_match = True
+                elif isinstance(category, list):
+                    category_match = metrics['category'] in category
+                else:
+                    category_match = metrics['category'] == category
+                
+                if not category_match:
+                    continue
+                
+                condition_results = []
+                for cond in conditions:
+                    condition_results.append(evaluate_condition(cond, metrics))
+                
+                if logic == 'AND':
+                    all_true = all(condition_results)
+                else:
+                    all_true = any(condition_results)
+                
+                if all_true:
+                    cross_factors.append((factor.get('id', 'unknown'), score_bonus))
+        except Exception as e:
+            print(f"加载跨因素规则失败: {e}")
     
-    elif metrics['category'] == 'design' or metrics['category'] == 'ai':
-        if metrics['memory'] > 20:
-            cross_factors.append(('heavy_memory', 8))
-        if metrics['cpu'] > 40:
-            cross_factors.append(('heavy_cpu', 5))
-    
-    elif metrics['category'] == 'browser':
-        if metrics['memory'] > 30:
-            cross_factors.append(('browser_memory', -5))
-        if metrics['cpu'] > 50:
-            cross_factors.append(('browser_cpu', 5))
-    
-    if metrics['proc_type'] == 'user_app' and metrics['status'] == 'running':
-        cross_factors.append(('active_user_app', 5))
-    
-    if metrics['threads'] > 50 and metrics['cpu'] > 20:
-        cross_factors.append(('heavy_compute', 8))
-    
-    if metrics['cpu'] < 2 and metrics['memory'] < 2 and metrics['status'] == 'sleeping':
-        cross_factors.append(('idle_process', -10))
+    if not cross_factors:
+        if metrics['category'] == 'gaming':
+            if metrics['cpu'] > 30 or metrics['memory'] > 15:
+                cross_factors.append(('gaming_active', 10))
+            if metrics['threads'] > 30:
+                cross_factors.append(('gaming_threads', 5))
+        elif metrics['category'] == 'design' or metrics['category'] == 'ai':
+            if metrics['memory'] > 20:
+                cross_factors.append(('heavy_memory', 8))
+            if metrics['cpu'] > 40:
+                cross_factors.append(('heavy_cpu', 5))
+        elif metrics['category'] == 'browser':
+            if metrics['memory'] > 30:
+                cross_factors.append(('browser_memory', -5))
+            if metrics['cpu'] > 50:
+                cross_factors.append(('browser_cpu', 5))
+        
+        if metrics['proc_type'] == 'user_app' and metrics['status'] == 'running':
+            cross_factors.append(('active_user_app', 5))
+        
+        if metrics['threads'] > 50 and metrics['cpu'] > 20:
+            cross_factors.append(('heavy_compute', 8))
+        
+        if metrics['cpu'] < 2 and metrics['memory'] < 2 and metrics['status'] == 'sleeping':
+            cross_factors.append(('idle_process', -10))
     
     cross_bonus = sum(f[1] for f in cross_factors)
     details['cross_factors'] = [f[0] for f in cross_factors]
     
     system_adjustment = 0
-    if system_metrics['cpu_percent'] > 80:
-        system_adjustment = -8
-    elif system_metrics['cpu_percent'] < 20:
-        system_adjustment = 5
+    if CONFIG_MANAGER:
+        try:
+            cross_config = CONFIG_MANAGER.get_cross_factors()
+            for adj in cross_config.get('system_adjustments', []):
+                condition = adj.get('condition', {})
+                adjustment = adj.get('adjustment', 0)
+                
+                sys_metrics = {
+                    'system_cpu': system_metrics.get('cpu_percent', 0),
+                    'system_memory': system_metrics.get('memory_percent', 0)
+                }
+                
+                if evaluate_condition(condition, sys_metrics):
+                    system_adjustment += adjustment
+        except Exception as e:
+            print(f"加载系统调整规则失败: {e}")
     
-    if system_metrics['memory_percent'] > 85:
-        system_adjustment -= 5
-    elif system_metrics['memory_percent'] < 40:
-        system_adjustment += 3
+    if system_adjustment == 0:
+        if system_metrics['cpu_percent'] > 80:
+            system_adjustment = -8
+        elif system_metrics['cpu_percent'] < 20:
+            system_adjustment = 5
+        
+        if system_metrics['memory_percent'] > 85:
+            system_adjustment -= 5
+        elif system_metrics['memory_percent'] < 40:
+            system_adjustment += 3
     
     scores['system'] = system_adjustment
     
@@ -806,6 +1453,7 @@ def cross_analysis_scoring(metrics, system_metrics, config):
     details['score_breakdown'] = {k: round(v, 1) for k, v in scores.items()}
     details['cross_bonus'] = cross_bonus
     details['system_adjustment'] = system_adjustment
+    details['scoring_method'] = 'rule_based'
     
     return final_score, details
 
@@ -823,31 +1471,44 @@ def analyze_process(process, system_metrics, admin_mode, config):
                 priority_name = PRIORITY_DISPLAY.get(get_priority_key(current_priority), '未知')
                 return {'name': process_name, 'pid': process.pid, 'status': 'protected', 
                         'reason': '系统保护进程', 'current_priority': priority_name}
-            except:
+            except Exception as e:
+                logger.debug(f"读取保护进程 {process_name} 优先级失败: {e}")
                 return {'name': process_name, 'pid': process.pid, 'status': 'protected', 
                         'reason': '系统保护进程', 'current_priority': '未知'}
         
         if need_admin(process_name_lower) and not admin_mode:
+            logger.debug(f"进程 {process_name} 需要管理员权限")
             return {'name': process_name, 'pid': process.pid, 'status': 'need_admin', 'reason': '需要管理员权限'}
         
         score, cpu_percent, memory_percent, proc_type, details = calculate_priority_score(process, system_metrics, config)
         
         if score is None:
+            logger.debug(f"无法读取进程 {process_name} 信息")
             return {'name': process_name, 'pid': process.pid, 'status': 'access_denied', 'reason': '无法读取进程信息'}
         
         priority_key, priority_name = score_to_priority(score)
         
         try:
             old_priority = process.nice()
-        except psutil.AccessDenied:
+        except psutil.AccessDenied as e:
+            if process_name_lower in KNOWN_LIMITED_PROCESSES:
+                logger.debug(f"读取受限进程 {process_name} 优先级失败(预期行为)")
+            else:
+                logger.warning(f"读取进程 {process_name} 优先级失败: {e}")
             return {'name': process_name, 'pid': process.pid, 'status': 'access_denied', 'reason': '无法读取优先级'}
         
         new_priority_value = PRIORITY_LEVELS[priority_key]
+        old_priority_name = PRIORITY_DISPLAY.get(get_priority_key(old_priority), '未知')
         
         if old_priority != new_priority_value:
             try:
                 process.nice(new_priority_value)
-            except psutil.AccessDenied:
+                logger.info(f"进程 {process_name}(PID:{process.pid}) 优先级已从 {old_priority_name} 调整为 {priority_name}")
+            except psutil.AccessDenied as e:
+                if process_name_lower in KNOWN_LIMITED_PROCESSES:
+                    logger.debug(f"设置受限进程 {process_name} 优先级失败(预期行为)")
+                else:
+                    logger.warning(f"设置进程 {process_name} 优先级失败: {e}")
                 return {'name': process_name, 'pid': process.pid, 'status': 'access_denied', 'reason': '无法设置优先级'}
         
         result = {
@@ -857,7 +1518,7 @@ def analyze_process(process, system_metrics, admin_mode, config):
             'memory_percent': memory_percent,
             'proc_type': proc_type,
             'score': round(score, 1),
-            'old_priority': PRIORITY_DISPLAY.get(get_priority_key(old_priority), '未知'),
+            'old_priority': old_priority_name,
             'new_priority': priority_name,
             'status': 'success'
         }
@@ -867,8 +1528,10 @@ def analyze_process(process, system_metrics, admin_mode, config):
         
         return result
     except psutil.NoSuchProcess:
+        logger.debug(f"进程 {process_name if 'process_name' in dir() else 'unknown'} 已终止")
         return {'name': 'unknown', 'pid': 0, 'status': 'no_such_process', 'reason': '进程已终止'}
-    except psutil.AccessDenied:
+    except psutil.AccessDenied as e:
+        logger.warning(f"访问进程被拒绝: {e}")
         return {'name': process_name if 'process_name' in dir() else 'unknown', 
                 'pid': process.pid if 'process' in dir() and hasattr(process, 'pid') else 0, 
                 'status': 'access_denied', 'reason': '访问被拒绝'}
@@ -885,6 +1548,336 @@ def search_processes(keyword=None):
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
     return results
+
+def get_all_windows_services(keyword=None):
+    """
+    查询所有Windows服务，包括运行中和未运行的服务
+    返回服务列表，每个服务包含名称、显示名称、状态、启动类型等信息
+    不执行优先级调整，仅用于显示
+    """
+    services = []
+    keyword_lower = keyword.lower() if keyword else None
+    
+    # 使用pywin32获取服务信息
+    try:
+        import win32service
+        import win32serviceutil
+        import win32con
+        
+        scm_handle = win32service.OpenSCManager(
+            None, None, win32service.SC_MANAGER_ENUMERATE_SERVICE
+        )
+        
+        try:
+            service_types = win32service.SERVICE_WIN32
+            service_states = win32service.SERVICE_STATE_ALL
+            
+            services_info = win32service.EnumServicesStatus(
+                scm_handle, service_types, service_states
+            )
+            
+            for service_name, display_name, service_status in services_info:
+                service_name_lower = service_name.lower()
+                
+                # 关键词过滤
+                if keyword_lower:
+                    if (keyword_lower not in service_name_lower and 
+                        keyword_lower not in display_name.lower()):
+                        continue
+                
+                status_code = service_status[1]
+                status_map = {
+                    win32service.SERVICE_STOPPED: '已停止',
+                    win32service.SERVICE_START_PENDING: '正在启动',
+                    win32service.SERVICE_STOP_PENDING: '正在停止',
+                    win32service.SERVICE_RUNNING: '正在运行',
+                    win32service.SERVICE_CONTINUE_PENDING: '正在继续',
+                    win32service.SERVICE_PAUSE_PENDING: '正在暂停',
+                    win32service.SERVICE_PAUSED: '已暂停'
+                }
+                status = status_map.get(status_code, '未知')
+                is_running = status_code == win32service.SERVICE_RUNNING
+                
+                # 获取启动类型
+                start_type = '未知'
+                service_pid = None
+                try:
+                    service_handle = win32service.OpenService(
+                        scm_handle, service_name, 
+                        win32service.SERVICE_QUERY_CONFIG | win32service.SERVICE_QUERY_STATUS
+                    )
+                    try:
+                        # 获取启动类型
+                        config = win32service.QueryServiceConfig(service_handle)
+                        start_type_code = config[0]
+                        start_type_map = {
+                            win32service.SERVICE_BOOT_START: '系统启动',
+                            win32service.SERVICE_SYSTEM_START: '系统启动',
+                            win32service.SERVICE_AUTO_START: '自动',
+                            win32service.SERVICE_DEMAND_START: '手动',
+                            win32service.SERVICE_DISABLED: '已禁用'
+                        }
+                        start_type = start_type_map.get(start_type_code, '未知')
+                        
+                        # 获取服务PID（仅对运行中的服务）
+                        if is_running:
+                            try:
+                                # 使用QueryServiceStatusEx获取进程ID
+                                status_info = win32service.QueryServiceStatusEx(service_handle)
+                                service_pid = status_info.get('ProcessId', None)
+                            except Exception:
+                                # 备用方法：通过进程名查找
+                                pass
+                    finally:
+                        win32service.CloseServiceHandle(service_handle)
+                except Exception:
+                    pass
+                
+                # 如果没有获取到PID，尝试通过进程名查找
+                if is_running and service_pid is None:
+                    try:
+                        service_exe_pattern = service_name.lower()
+                        for proc in psutil.process_iter(['pid', 'name']):
+                            try:
+                                if service_exe_pattern in proc.name().lower():
+                                    service_pid = proc.pid
+                                    break
+                            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                                pass
+                    except Exception:
+                        pass
+                
+                services.append({
+                    'name': service_name,
+                    'display_name': display_name,
+                    'status': status,
+                    'status_code': status_code,
+                    'start_type': start_type,
+                    'pid': service_pid,
+                    'is_running': is_running
+                })
+                
+        finally:
+            win32service.CloseServiceHandle(scm_handle)
+            
+        logger.info(f"找到 {len(services)} 个Windows服务")
+        return services
+            
+    except ImportError:
+        logger.warning("pywin32未安装")
+        # 备用方法：使用subprocess调用sc命令
+        try:
+            import subprocess
+            
+            # 获取所有服务列表
+            result = subprocess.run(
+                ['powershell', '-Command', 'Get-Service | Select-Object Name, DisplayName, Status, StartType | ConvertTo-Json'],
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+            
+            if result.returncode == 0 and result.stdout:
+                import json
+                service_list = json.loads(result.stdout)
+                
+                # 确保是列表格式
+                if isinstance(service_list, dict):
+                    service_list = [service_list]
+                
+                for svc in service_list:
+                    name = svc.get('Name', '')
+                    display_name = svc.get('DisplayName', '')
+                    status_code = svc.get('Status', 0)
+                    start_type_code = svc.get('StartType', '')
+                    
+                    if keyword_lower:
+                        if (keyword_lower not in name.lower() and 
+                            keyword_lower not in display_name.lower()):
+                            continue
+                    
+                    status_map = {
+                        1: '已停止',
+                        2: '正在启动',
+                        3: '正在停止',
+                        4: '正在运行',
+                        5: '正在继续',
+                        6: '正在暂停',
+                        7: '已暂停'
+                    }
+                    status = status_map.get(status_code, '未知')
+                    is_running = status_code == 4
+                    
+                    start_type_map = {
+                        'Automatic': '自动',
+                        'Manual': '手动',
+                        'Disabled': '已禁用',
+                        'Boot': '系统启动',
+                        'System': '系统启动'
+                    }
+                    start_type = start_type_map.get(str(start_type_code), '未知')
+                    
+                    services.append({
+                        'name': name,
+                        'display_name': display_name,
+                        'status': status,
+                        'status_code': status_code,
+                        'start_type': start_type,
+                        'pid': None,
+                        'is_running': is_running
+                    })
+                    
+            logger.info(f"找到 {len(services)} 个Windows服务 (PowerShell)")
+            return services
+                
+        except Exception as e:
+            logger.error(f"查询Windows服务失败: {e}")
+            
+    except Exception as e:
+        logger.error(f"查询Windows服务失败: {e}")
+    
+    logger.info(f"找到 {len(services)} 个Windows服务")
+    return services
+
+def analyze_all_services(keyword=None, display_only=True):
+    """
+    分析所有Windows服务，显示服务状态但不执行优先级调整
+    
+    Args:
+        keyword: 可选的关键词，用于过滤服务
+        display_only: 是否仅显示而不执行优先级调整（默认为True）
+    
+    Returns:
+        服务列表，包含详细的状态信息
+    """
+    logger.info("开始分析Windows服务")
+    
+    # 获取所有服务
+    services = get_all_windows_services(keyword)
+    
+    # 添加额外的分析信息
+    for service in services:
+        # 标记服务类型
+        service_name_lower = service['name'].lower()
+        
+        # 判断服务类型
+        if service_name_lower in SYSTEM_PROCESSES:
+            service['category'] = 'system'
+            service['category_display'] = '系统服务'
+        elif service_name_lower in USER_APP_PROCESSES:
+            service['category'] = 'user_app'
+            service['category_display'] = '用户应用服务'
+        else:
+            # 根据服务名称推断类型
+            if any(keyword in service_name_lower for keyword in ['windows', 'microsoft', 'system']):
+                service['category'] = 'system'
+                service['category_display'] = '系统服务'
+            elif any(keyword in service_name_lower for keyword in ['chrome', 'edge', 'firefox', 'steam', 'spotify']):
+                service['category'] = 'user_app'
+                service['category_display'] = '用户应用服务'
+            else:
+                service['category'] = 'unknown'
+                service['category_display'] = '其他服务'
+        
+        # 标记是否可以调整优先级
+        service['can_adjust_priority'] = (
+            service['is_running'] and 
+            service['pid'] is not None and 
+            service_name_lower not in PROTECTED_PROCESSES
+        )
+        
+        # 优先级显示（仅用于显示，不实际调整）
+        if service['is_running'] and service['pid']:
+            try:
+                proc = psutil.Process(service['pid'])
+                priority_value = proc.nice()
+                priority_key = get_priority_key(priority_value)
+                service['current_priority'] = PRIORITY_DISPLAY.get(priority_key, '未知')
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                service['current_priority'] = '无法获取'
+        else:
+            service['current_priority'] = 'N/A'
+    
+    # 统计信息
+    running_count = sum(1 for s in services if s['is_running'])
+    stopped_count = len(services) - running_count
+    
+    logger.info(f"服务分析完成: 运行中 {running_count} 个, 已停止 {stopped_count} 个, 总计 {len(services)} 个")
+    
+    # 如果display_only为True，仅返回结果不执行任何调整
+    if display_only:
+        return services
+    
+    # 如果display_only为False，可以在这里添加优先级调整逻辑
+    # 但根据用户要求，默认情况下不执行优先级调整
+    return services
+
+def analyze_all_processes(use_incremental=False):
+    try:
+        logger.info("开始分析所有进程")
+        system_metrics = get_system_metrics()
+        admin_mode = is_admin()
+        config = load_config()
+        
+        if not hasattr(APP, '_initialized') or not APP._initialized:
+            APP.initialize()
+        
+        if use_incremental and APP.incremental_scanner:
+            new_procs, terminated_procs, changed_procs = APP.incremental_scanner.scan()
+            logger.info(f"增量扫描: 新增 {len(new_procs)} 个, 终止 {len(terminated_procs)} 个, 变化 {len(changed_procs)} 个")
+            
+            processes_to_analyze = []
+            for snapshot in new_procs:
+                try:
+                    proc = psutil.Process(snapshot.pid)
+                    processes_to_analyze.append(proc)
+                except psutil.NoSuchProcess:
+                    continue
+            
+            for snapshot in changed_procs:
+                try:
+                    proc = psutil.Process(snapshot.pid)
+                    processes_to_analyze.append(proc)
+                except psutil.NoSuchProcess:
+                    continue
+            
+            if not processes_to_analyze:
+                logger.info("没有需要分析的进程")
+                return []
+        else:
+            processes_to_analyze = search_processes()
+            if APP.incremental_scanner:
+                APP.incremental_scanner.reset()
+        
+        logger.info(f"找到 {len(processes_to_analyze)} 个进程")
+        results = parallel_analyze(processes_to_analyze, system_metrics, admin_mode, config)
+        
+        success_count = sum(1 for r in results if r.get('status') == 'success')
+        logger.info(f"进程分析完成: 成功 {success_count} 个, 总计 {len(results)} 个")
+        
+        return results
+    except Exception as e:
+        logger.error(f"分析进程失败: {e}")
+        return []
+
+def get_process_list_for_snapshot():
+    processes = []
+    for proc in psutil.process_iter(['pid', 'name', 'cpu_percent', 'memory_percent', 'memory_info', 'num_threads']):
+        try:
+            processes.append({
+                'pid': proc.pid,
+                'name': proc.name(),
+                'cpu_percent': proc.cpu_percent(interval=None),
+                'memory_percent': proc.memory_percent(),
+                'memory_rss': proc.memory_info().rss if proc.memory_info() else 0,
+                'num_threads': proc.num_threads(),
+                'priority': 'normal',
+                'score': 0,
+                'category': 'unknown'
+            })
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    return processes
 
 def search_exe_files(max_results=100):
     exe_files = []
@@ -914,40 +1907,32 @@ def search_exe_files(max_results=100):
         pass
     return exe_files
 
-def worker(queue, system_metrics, admin_mode, config, results, lock):
-    while True:
-        proc = queue.get()
-        if proc is None:
-            break
-        try:
-            result = analyze_process(proc, system_metrics, admin_mode, config)
-            with lock:
-                results.append(result)
-        except:
-            pass
-        queue.task_done()
+def analyze_process_wrapper(args):
+    proc, system_metrics, admin_mode, config = args
+    try:
+        return analyze_process(proc, system_metrics, admin_mode, config)
+    except Exception as e:
+        logger.debug(f"进程分析包装函数异常: {e}")
+        return None
 
 def parallel_analyze(processes, system_metrics, admin_mode, config):
-    queue = Queue()
-    results = []
-    lock = threading.Lock()
+    """并行分析进程，根据性能模式动态调整线程池大小"""
+    if not processes:
+        return []
     
-    for proc in processes:
-        queue.put(proc)
+    process_count = len(processes)
     
-    for _ in range(THREAD_COUNT):
-        queue.put(None)
+    # 根据性能模式获取线程池大小，避免占用过多资源
+    base_workers = get_thread_pool_size()
+    max_workers = min(base_workers, process_count)
     
-    threads = []
-    for _ in range(THREAD_COUNT):
-        t = threading.Thread(target=worker, args=(queue, system_metrics, admin_mode, config, results, lock))
-        t.start()
-        threads.append(t)
+    logger.debug(f"并行分析: {process_count} 个进程, 使用 {max_workers} 线程")
     
-    for t in threads:
-        t.join()
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        args = [(proc, system_metrics, admin_mode, config) for proc in processes]
+        results = list(executor.map(analyze_process_wrapper, args))
     
-    return results
+    return [r for r in results if r is not None]
 
 def write_log(log_entries):
     try:
@@ -1069,113 +2054,6 @@ def scan_and_configure(config):
     except ValueError:
         print("输入无效")
 
-def show_gpu_config_menu(config):
-    while True:
-        print("\n" + "=" * 70)
-        print("                GPU 配置管理")
-        print("=" * 70)
-        
-        current_settings = get_gpu_settings_from_registry()
-        if current_settings:
-            print("\n[当前GPU配置]")
-            print("-" * 70)
-            for exe_name, setting in current_settings.items():
-                print(f"  {exe_name:<25} -> {setting.get('gpu_preference', '自定义')}")
-        
-        print("\n[自定义配置]")
-        print("-" * 70)
-        if 'gpu_settings' in config and config['gpu_settings']:
-            for exe_name, setting in config['gpu_settings'].items():
-                gpu_name = GPU_PREFERENCES.get(setting, setting)
-                print(f"  {exe_name:<25} -> {gpu_name}")
-        else:
-            print("  暂无自定义配置")
-        
-        print("\n[操作菜单]")
-        print("-" * 70)
-        print("1. 添加单个GPU配置")
-        print("2. 删除GPU配置")
-        print("3. 查看优先级规则")
-        print("4. 添加优先级规则")
-        print("5. 批量配置GPU (扫描硬盘)")
-        print("6. 返回主菜单")
-        
-        try:
-            choice = input("\n请输入选择 (1-6): ")
-            if choice == '1':
-                exe_name = input("请输入进程名(如 game.exe): ").strip()
-                print("\nGPU选项:")
-                print("  a - 让 Windows 决定")
-                print("  i - 节能 (集成显卡)")
-                print("  d - 高性能 (独立显卡)")
-                gpu_choice = input("请选择GPU (a/i/d): ").strip().lower()
-                
-                if gpu_choice in ['a', 'i', 'd']:
-                    gpu_map = {'a': 'auto', 'i': 'integrated', 'd': 'discrete'}
-                    config['gpu_settings'][exe_name] = gpu_map[gpu_choice]
-                    
-                    full_path = None
-                    for proc in psutil.process_iter(['pid', 'name', 'exe']):
-                        try:
-                            if proc.name().lower() == exe_name.lower():
-                                full_path = proc.exe()
-                                break
-                        except:
-                            continue
-                    
-                    if full_path and set_gpu_preference(full_path, gpu_map[gpu_choice]):
-                        print(f"已成功设置 {exe_name} 的GPU偏好")
-                    save_config(config)
-                else:
-                    print("无效选择")
-            
-            elif choice == '2':
-                exe_name = input("请输入要删除的进程名: ").strip()
-                if exe_name in config['gpu_settings']:
-                    del config['gpu_settings'][exe_name]
-                    save_config(config)
-                    print(f"已删除 {exe_name} 的配置")
-                else:
-                    print("未找到该配置")
-            
-            elif choice == '3':
-                print("\n[优先级规则]")
-                print("-" * 70)
-                if 'priority_rules' in config and config['priority_rules']:
-                    for i, (name, rule) in enumerate(config['priority_rules'].items(), 1):
-                        print(f"{i}. {name}:")
-                        print(f"   进程名: {rule.get('process_name', '')}")
-                        print(f"   评分调整: {rule.get('score_adjustment', 0)}")
-                else:
-                    print("  暂无优先级规则")
-            
-            elif choice == '4':
-                rule_name = input("请输入规则名称: ").strip()
-                process_name = input("请输入进程名(支持包含匹配): ").strip()
-                adjustment = int(input("请输入评分调整值(正数提高优先级，负数降低): ").strip())
-                
-                config['priority_rules'][rule_name] = {
-                    'process_name': process_name,
-                    'score_adjustment': adjustment
-                }
-                save_config(config)
-                print(f"已添加规则: {rule_name}")
-            
-            elif choice == '5':
-                scan_and_configure(config)
-            
-            elif choice == '6':
-                cleanup_windows_apps()
-            
-            else:
-                print("无效选择")
-
-        except KeyboardInterrupt:
-            print("\n已取消操作")
-            return
-        except ValueError:
-            print("输入无效")
-
 WINDOWS_BUNDLED_APPS = {
     '3dbuilder': {'name': '3D Builder', 'description': '3D建模工具', 'safe': True},
     'alarms': {'name': '闹钟和时钟', 'description': '闹钟应用', 'safe': False},
@@ -1241,6 +2119,195 @@ SAFE_TO_REMOVE_DEFAULT = [
     'windowsmaps', 'windowsphone', 'windowsscan', 'windowstips', 'worldclock',
     'yourphone', 'zunemusic', 'zunevideo'
 ]
+
+def get_pagefile_info():
+    import subprocess
+    try:
+        result = subprocess.run(
+            ['powershell', '-Command', '''
+            $pagefile = Get-CimInstance -ClassName Win32_PageFileUsage
+            $pagefileConfig = Get-CimInstance -ClassName Win32_PageFileSetting
+            $totalMemory = (Get-CimInstance -ClassName Win32_ComputerSystem).TotalPhysicalMemory / 1GB
+            [PSCustomObject]@{
+                CurrentUsageGB = if ($pagefile) { $pagefile.CurrentUsage / 1024 } else { 0 }
+                PeakUsageGB = if ($pagefile) { $pagefile.PeakUsage / 1024 } else { 0 }
+                AllocatedGB = if ($pagefileConfig) { $pagefileConfig.AllocatedBaseSize / 1024 } else { 0 }
+                MinSizeGB = if ($pagefileConfig) { $pagefileConfig.MinimumSize / 1024 } else { 0 }
+                MaxSizeGB = if ($pagefileConfig) { $pagefileConfig.MaximumSize / 1024 } else { 0 }
+                TotalRAM = $totalMemory
+                Drive = if ($pagefile) { $pagefile.Name } else { "Unknown" }
+            } | ConvertTo-Json
+            '''.strip()],
+            capture_output=True, text=True, timeout=30
+        )
+        if result.returncode == 0:
+            import json
+            return json.loads(result.stdout)
+    except Exception as e:
+        print(f"获取虚拟内存信息失败: {e}")
+    return None
+
+def suggest_pagefile_settings():
+    print("\n" + "=" * 70)
+    print("              虚拟内存（页面文件）优化建议")
+    print("=" * 70)
+    
+    info = get_pagefile_info()
+    if not info:
+        print("无法获取虚拟内存信息")
+        return
+    
+    total_ram = round(info['TotalRAM'], 1)
+    current_usage = round(info['CurrentUsageGB'], 1)
+    peak_usage = round(info['PeakUsageGB'], 1)
+    allocated = round(info['AllocatedGB'], 1)
+    min_size = round(info['MinSizeGB'], 1)
+    max_size = round(info['MaxSizeGB'], 1)
+    
+    print(f"\n[当前系统配置]")
+    print("-" * 50)
+    print(f"物理内存: {total_ram} GB")
+    print(f"虚拟内存当前使用: {current_usage} GB")
+    print(f"虚拟内存峰值使用: {peak_usage} GB")
+    print(f"当前分配大小: {allocated} GB")
+    print(f"最小值: {min_size} GB")
+    print(f"最大值: {max_size} GB")
+    
+    print("\n[推荐配置]")
+    print("-" * 50)
+    
+    if total_ram <= 8:
+        recommended_min = total_ram * 1.5
+        recommended_max = total_ram * 2
+        print(f"• 物理内存较小 (<=8GB)")
+        print(f"  推荐: 最小值 {round(recommended_min,1)}GB, 最大值 {round(recommended_max,1)}GB")
+    elif total_ram <= 16:
+        recommended_min = total_ram
+        recommended_max = total_ram * 1.5
+        print(f"• 物理内存适中 (8GB-16GB)")
+        print(f"  推荐: 最小值 {round(recommended_min,1)}GB, 最大值 {round(recommended_max,1)}GB")
+    elif total_ram <= 32:
+        recommended_min = total_ram * 0.5
+        recommended_max = total_ram
+        print(f"• 物理内存充足 (16GB-32GB)")
+        print(f"  推荐: 最小值 {round(recommended_min,1)}GB, 最大值 {round(recommended_max,1)}GB")
+    else:
+        recommended_min = 8
+        recommended_max = 16
+        print(f"• 物理内存充裕 (>=32GB)")
+        print(f"  推荐: 最小值 {recommended_min}GB, 最大值 {recommended_max}GB")
+    
+    print("\n[优化建议]")
+    print("-" * 50)
+    
+    if max_size == 0 or min_size == 0:
+        print("❌ 警告: 虚拟内存可能被禁用")
+        print("   建议: 启用虚拟内存，设为系统管理或手动配置")
+    elif max_size - min_size > 8:
+        print("⚠️  提示: 虚拟内存范围过大")
+        print("   建议: 将最大最小值设为相同或相近，减少磁盘碎片")
+    elif allocated > total_ram * 2:
+        print("⚠️  提示: 虚拟内存分配过大")
+        print("   建议: 减少虚拟内存大小，避免占用过多磁盘空间")
+    elif peak_usage > total_ram:
+        print("⚠️  提示: 虚拟内存峰值使用较高")
+        print("   建议: 考虑增加物理内存或调整虚拟内存配置")
+    else:
+        print("✅ 当前虚拟内存配置较为合理")
+    
+    print("\n[设置方法]")
+    print("-" * 50)
+    print("1. 右键点击「此电脑」→ 属性")
+    print("2. 点击「高级系统设置」")
+    print("3. 在「高级」选项卡点击「性能」区域的「设置」")
+    print("4. 在「高级」选项卡点击「虚拟内存」区域的「更改」")
+    print("5. 取消勾选「自动管理所有驱动器的分页文件大小」")
+    print("6. 选择系统盘，设置「自定义大小」")
+    print("7. 输入推荐的最小值和最大值，点击「设置」→「确定」")
+    
+    if is_admin():
+        print("\n[快速设置]")
+        print("-" * 50)
+        print("是否需要我帮你设置虚拟内存？")
+        print("[1] 设置为推荐值")
+        print("[2] 设置为系统管理")
+        print("[3] 返回")
+        
+        try:
+            choice = input("\n请输入选择 (1-3): ").strip()
+            if choice == '1':
+                set_pagefile(recommended_min, recommended_max)
+            elif choice == '2':
+                set_pagefile_auto()
+            elif choice == '3':
+                return
+            else:
+                print("无效选择")
+        except KeyboardInterrupt:
+            print("\n已取消")
+        except ValueError:
+            print("输入无效")
+
+def set_pagefile(min_gb, max_gb):
+    import subprocess
+    try:
+        min_mb = int(min_gb * 1024)
+        max_mb = int(max_gb * 1024)
+        
+        command = f'''
+        $drive = $env:SystemDrive
+        Write-Host "正在设置虚拟内存: $drive"
+        Write-Host "最小值: {min_mb} MB"
+        Write-Host "最大值: {max_mb} MB"
+        
+        Set-CimInstance -ClassName Win32_PageFileSetting -Property @{{
+            MinimumSize = {min_mb}
+            MaximumSize = {max_mb}
+        }} -Filter "Name='${{drive}}\\pagefile.sys'"
+        
+        if ($?) {{
+            Write-Host "虚拟内存设置成功，需要重启生效"
+        }} else {{
+            Write-Host "设置失败"
+        }}
+        '''
+        
+        result = subprocess.run(
+            ['powershell', '-Command', command],
+            capture_output=True, text=True, timeout=60
+        )
+        
+        print(result.stdout)
+        if result.stderr:
+            print(f"错误: {result.stderr}")
+            
+    except Exception as e:
+        print(f"设置失败: {e}")
+
+def set_pagefile_auto():
+    import subprocess
+    try:
+        command = '''
+        Write-Host "正在设置虚拟内存为系统管理..."
+        Set-CimInstance -ClassName Win32_PageFileSetting -Property @{AutomaticManagedPagefile = $true}
+        if ($?) {
+            Write-Host "设置成功，需要重启生效"
+        } else {
+            Write-Host "设置失败"
+        }
+        '''
+        
+        result = subprocess.run(
+            ['powershell', '-Command', command],
+            capture_output=True, text=True, timeout=60
+        )
+        
+        print(result.stdout)
+        if result.stderr:
+            print(f"错误: {result.stderr}")
+            
+    except Exception as e:
+        print(f"设置失败: {e}")
 
 def get_installed_apps():
     import subprocess
@@ -1574,11 +2641,10 @@ def show_gpu_config_menu(config):
         print("3. 查看优先级规则")
         print("4. 添加优先级规则")
         print("5. 批量配置GPU (扫描硬盘)")
-        print("6. Windows应用清理器")
-        print("7. 返回主菜单")
+        print("6. 返回上级菜单")
         
         try:
-            choice = input("\n请输入选择 (1-7): ")
+            choice = input("\n请输入选择 (1-6): ")
             if choice == '1':
                 exe_name = input("请输入进程名(如 game.exe): ").strip()
                 print("\nGPU选项:")
@@ -1642,9 +2708,6 @@ def show_gpu_config_menu(config):
                 scan_and_configure(config)
             
             elif choice == '6':
-                cleanup_windows_apps()
-            
-            elif choice == '7':
                 return
             
             else:
@@ -1656,23 +2719,628 @@ def show_gpu_config_menu(config):
         except ValueError:
             print("输入无效")
 
+
+def show_system_cleanup_menu(config):
+    cleanup_windows_apps()
+
+
+def show_system_optimization_menu(config):
+    suggest_pagefile_settings()
+
+
+def show_config_import_export_menu():
+    while True:
+        print("\n" + "=" * 70)
+        print("                配置导入/导出")
+        print("=" * 70)
+        print("\n[功能菜单]")
+        print("-" * 70)
+        print("1. 导出配置包")
+        print("2. 导入配置包")
+        print("3. 查看当前配置状态")
+        print("4. 热重载配置")
+        print("5. 返回上级菜单")
+        
+        try:
+            choice = input("\n请输入选择 (1-5): ")
+            if choice == '1':
+                if CONFIG_MANAGER:
+                    path = CONFIG_MANAGER.export_config()
+                    if path:
+                        print(f"\n✅ 配置已导出到: {path}")
+                    else:
+                        print("\n❌ 导出失败")
+                else:
+                    print("\n❌ 配置管理器不可用")
+            elif choice == '2':
+                if CONFIG_MANAGER:
+                    import_path = input("请输入配置包路径: ").strip()
+                    if CONFIG_MANAGER.import_config(import_path):
+                        print("\n✅ 配置导入成功")
+                    else:
+                        print("\n❌ 导入失败")
+                else:
+                    print("\n❌ 配置管理器不可用")
+            elif choice == '3':
+                if CONFIG_MANAGER:
+                    config = CONFIG_MANAGER.get_app_categories()
+                    print(f"\n配置版本: {config.get('version', '未知')}")
+                    print(f"更新时间: {config.get('last_updated', '未知')}")
+                    print(f"分类数量: {len(config.get('categories', {}))}")
+                else:
+                    print("\n❌ 配置管理器不可用")
+            elif choice == '4':
+                if CONFIG_MANAGER:
+                    CONFIG_MANAGER.reload_all()
+                    print("\n✅ 配置已重载")
+                else:
+                    print("\n❌ 配置管理器不可用")
+            elif choice == '5':
+                return
+            else:
+                print("无效选择")
+        except KeyboardInterrupt:
+            print("\n已取消操作")
+            return
+
+def show_monitoring_menu():
+    while True:
+        print("\n" + "=" * 70)
+        print("                监控与报告")
+        print("=" * 70)
+        print("\n[功能菜单]")
+        print("-" * 70)
+        print("1. 生成优化报告")
+        print("2. 导出报告(JSON)")
+        print("3. 检测异常进程")
+        print("4. Windows性能计数器")
+        print("5. 返回上级菜单")
+        
+        try:
+            choice = input("\n请输入选择 (1-5): ")
+            if choice == '1':
+                if HISTORY_MANAGER:
+                    print(HISTORY_MANAGER.get_report_summary_text())
+                else:
+                    print("\n❌ 历史管理器不可用")
+            elif choice == '2':
+                if HISTORY_MANAGER:
+                    path = HISTORY_MANAGER.export_report()
+                    if path:
+                        print(f"\n✅ 报告已导出到: {path}")
+                    else:
+                        print("\n❌ 导出失败")
+                else:
+                    print("\n❌ 历史管理器不可用")
+            elif choice == '3':
+                if HISTORY_MANAGER:
+                    anomalies = HISTORY_MANAGER.detect_anomalies()
+                    if anomalies:
+                        print("\n[异常进程检测结果]")
+                        print("-" * 70)
+                        for anomaly in anomalies:
+                            severity = "🔴 高" if anomaly['severity'] == 'high' else "🟡 中"
+                            print(f"\n{severity} {anomaly['process_name']}")
+                            print(f"  CPU: {anomaly['current_cpu']:.1f}% | 内存: {anomaly['current_memory']:.1f}%")
+                            print(f"  原因: {', '.join(anomaly['reasons'])}")
+                    else:
+                        print("\n✅ 未检测到异常进程")
+                else:
+                    print("\n❌ 历史管理器不可用")
+            elif choice == '4':
+                if PERF_COUNTER:
+                    print(PERF_COUNTER.get_formatted_metrics())
+                else:
+                    print("\n❌ 性能计数器不可用")
+            elif choice == '5':
+                return
+            else:
+                print("无效选择")
+        except KeyboardInterrupt:
+            print("\n已取消操作")
+            return
+
+def show_advanced_menu(config):
+    while True:
+        print("\n" + "=" * 70)
+        print("                高级功能管理")
+        print("=" * 70)
+        print("\n[功能菜单]")
+        print("-" * 70)
+        print("1. GPU 配置管理")
+        print("2. Windows应用清理")
+        print("3. 虚拟内存优化")
+        print("4. 配置导入/导出")
+        print("5. 监控与报告")
+        print("6. 返回主菜单")
+        
+        try:
+            choice = input("\n请输入选择 (1-6): ")
+            if choice == '1':
+                show_gpu_config_menu(config)
+            elif choice == '2':
+                show_system_cleanup_menu(config)
+            elif choice == '3':
+                show_system_optimization_menu(config)
+            elif choice == '4':
+                show_config_import_export_menu()
+            elif choice == '5':
+                show_monitoring_menu()
+            elif choice == '6':
+                return
+            else:
+                print("无效选择")
+        except KeyboardInterrupt:
+            print("\n已取消操作")
+            return
+
+
+# ==================== 系统托盘功能 ====================
+
+APP_DISPLAY_NAME = "智优进程管理器"
+APP_VERSION = "v1.1.0"
+
+def create_tray_icon():
+    """创建精美的托盘图标"""
+    try:
+        width = 64
+        height = 64
+        image = Image.new('RGB', (width, height), color=(80, 150, 220))
+        draw = ImageDraw.Draw(image)
+        
+        # 绘制一个现代风格的CPU图标
+        
+        # 外框 - 使用圆角矩形（兼容旧版PIL）
+        draw.ellipse([8, 8, 56, 56], fill=(60, 120, 200))
+        
+        # 散热片 - 三个矩形
+        draw.rectangle([12, 12, 18, 52], fill=(100, 160, 230))
+        draw.rectangle([28, 16, 36, 48], fill=(100, 160, 230))
+        draw.rectangle([46, 12, 52, 52], fill=(100, 160, 230))
+        
+        # 中心装饰
+        draw.ellipse([26, 26, 38, 38], fill=(160, 200, 250))
+        
+        # 添加光泽效果
+        draw.ellipse([10, 10, 20, 20], fill=(255, 255, 255, 50))
+        
+        logger.debug("精美托盘图标创建成功")
+        return image
+    except Exception as e:
+        logger.error(f"创建图标失败: {e}")
+        # 返回一个简单的备用图标
+        image = Image.new('RGB', (64, 64), color=(80, 150, 220))
+        draw = ImageDraw.Draw(image)
+        draw.ellipse([10, 10, 54, 54], fill=(120, 180, 240))
+        return image
+
+def on_tray_click(icon, item):
+    """托盘菜单点击处理"""
+    item_str = str(item)
+    logger.info(f"托盘菜单点击: {item_str}")
+    
+    try:
+        if item_str == "查看状态":
+            show_status()
+        elif item_str == "查看游戏":
+            show_games()
+        elif item_str == "立即优化":
+            run_optimization()
+        elif item_str == "查看服务":
+            show_services()
+        elif item_str == "退出":
+            logger.info("用户点击退出")
+            icon.stop()
+            sys.exit(0)
+    except Exception as e:
+        logger.error(f"托盘菜单处理失败: {e}")
+        import traceback
+        traceback.print_exc()
+
+def show_games():
+    """显示当前运行的游戏 - 在单独线程中执行"""
+    def _show_games():
+        try:
+            if hasattr(APP, 'detect_games'):
+                has_games, game_list = APP.detect_games()
+                
+                
+                game_text = "╔══════════════════════════════════════════════════════════╗\n"
+                game_text += "║           智优进程管理器 v1.1.0 - 游戏检测              ║\n"
+                game_text += "╚══════════════════════════════════════════════════════════╝\n\n"
+                
+                if has_games:
+                    game_text += "┌──────────────────────────────────────────────────────────┐\n"
+                    game_text += f"│  🎮 检测到 {len(game_list)} 个游戏进程                     │\n"
+                    game_text += "├──────────────────────────────────────────────────────────┤\n"
+                    
+                    for i, game in enumerate(game_list[:10], 1):
+                        game_text += f"│  {i:2d}. {game:45} │\n"
+                    if len(game_list) > 10:
+                        game_text += f"│     ... 等共 {len(game_list)} 个游戏                        │\n"
+                    
+                    game_text += "└──────────────────────────────────────────────────────────┘\n"
+                    
+                    game_text += "\n┌──────────────────────────────────────────────────────────┐\n"
+                    game_text += "│                     优化状态                            │\n"
+                    game_text += "├──────────────────────────────────────────────────────────┤\n"
+                    game_text += "│  ✅ 智能优化:      已启用                              │\n"
+                    game_text += f"│  ⏱ 优化冷却:      {APP.game_cooldown}秒                  │\n"
+                    game_text += f"│  🔄 已优化次数:    {APP.game_optimization_count}次        │\n"
+                    
+                    remaining = APP.game_cooldown - (time.time() - APP.last_game_optimization)
+                    if remaining > 0:
+                        game_text += f"│  ⏳ 下次优化:      {int(remaining)}秒后                  │\n"
+                    else:
+                        game_text += "│  🟢 下次优化:      随时可以                            │\n"
+                    game_text += "└──────────────────────────────────────────────────────────┘\n"
+                    
+                else:
+                    game_text += "┌──────────────────────────────────────────────────────────┐\n"
+                    game_text += "│  ⏳ 当前没有检测到游戏进程                               │\n"
+                    game_text += "├──────────────────────────────────────────────────────────┤\n"
+                    game_text += "│  游戏检测功能持续监控中...                              │\n"
+                    game_text += "│  启动游戏后将自动优化相关进程                          │\n"
+                    game_text += "│  支持: Steam、Epic、原神、明日方舟等100+游戏            │\n"
+                    game_text += "└──────────────────────────────────────────────────────────┘\n"
+                
+                # 打印到控制台
+                print("\n" + game_text)
+                
+                # 显示消息框（简化版）
+                try:
+                    import tkinter as tk
+                    from tkinter import messagebox
+                    root = tk.Tk()
+                    root.withdraw()
+                    
+                    msg_text = f"智优进程管理器 - 游戏检测\n\n"
+                    if has_games:
+                        msg_text += f"检测到 {len(game_list)} 个游戏进程:\n\n"
+                        for i, game in enumerate(game_list[:7], 1):
+                            msg_text += f"{i}. {game}\n"
+                        if len(game_list) > 7:
+                            msg_text += f"...\n\n共 {len(game_list)} 个游戏"
+                        msg_text += f"\n\n优化状态:\n"
+                        msg_text += f"  智能优化: 已启用\n"
+                        msg_text += f"  优化冷却: {APP.game_cooldown}秒\n"
+                        msg_text += f"  已优化次数: {APP.game_optimization_count}\n"
+                        remaining = APP.game_cooldown - (time.time() - APP.last_game_optimization)
+                        msg_text += f"  下次优化: {'随时可以' if remaining <= 0 else f'{int(remaining)}秒后'}"
+                    else:
+                        msg_text += "当前没有检测到游戏进程\n\n"
+                        msg_text += "游戏检测功能持续监控中...\n"
+                        msg_text += "启动游戏后将自动优化相关进程"
+                    
+                    messagebox.showinfo("游戏检测", msg_text)
+                    root.destroy()
+                except ImportError:
+                    pass
+            else:
+                print("游戏检测功能不可用")
+                
+        except Exception as e:
+            logger.error(f"显示游戏信息失败: {e}")
+    
+    thread = threading.Thread(target=_show_games, daemon=True)
+    thread.start()
+
+def show_status():
+    """显示当前系统状态 - 在单独线程中执行"""
+    def _show_status():
+        try:
+            system_metrics = get_system_metrics()
+            
+            
+            status_text = "╔══════════════════════════════════════════════════════════╗\n"
+            status_text += "║           智优进程管理器 v1.1.0 - 系统状态              ║\n"
+            status_text += "╚══════════════════════════════════════════════════════════╝\n\n"
+            
+            
+            status_text += "┌──────────────────────────────────────────────────────────┐\n"
+            status_text += f"│  CPU:    {system_metrics['cpu_percent']:3d}%  ({system_metrics['cpu_count']}核)            │\n"
+            status_text += f"│  内存:   {system_metrics['memory_percent']:3d}%                      │\n"
+            status_text += f"│  可用内存: {system_metrics['memory_available']:5.1f} GB              │\n"
+            status_text += "└──────────────────────────────────────────────────────────┘\n"
+            
+            
+            if system_metrics['gpus']:
+                status_text += "\n┌──────────────────────────────────────────────────────────┐\n"
+                status_text += "│                     GPU 信息                           │\n"
+                status_text += "├──────────────────────────────────────────────────────────┤\n"
+                for i, gpu in enumerate(system_metrics['gpus']):
+                    gpu_name = gpu['name'][:35] if len(gpu['name']) > 35 else gpu['name']
+                    status_text += f"│  GPU {i+1}: {gpu_name:35} {gpu['utilization']:3d}%  │\n"
+                status_text += "└──────────────────────────────────────────────────────────┘\n"
+            
+            
+            status_text += "\n┌──────────────────────────────────────────────────────────┐\n"
+            status_text += "│                   游戏检测状态                          │\n"
+            status_text += "├──────────────────────────────────────────────────────────┤\n"
+            
+            if hasattr(APP, 'detect_games'):
+                has_games, game_list = APP.detect_games()
+                if has_games:
+                    games_str = ", ".join(game_list[:3])
+                    if len(game_list) > 3:
+                        games_str += f" 等{len(game_list)}个"
+                    status_text += f"│  🎮 检测到游戏: {games_str:40} │\n"
+                    status_text += "│     智能优化:      ✅ 已启用                            │\n"
+                    status_text += f"│     已优化次数:    {APP.game_optimization_count:3d}次                     │\n"
+                    remaining = APP.game_cooldown - (time.time() - APP.last_game_optimization)
+                    if remaining > 0:
+                        status_text += f"│     下次优化:      {int(remaining):4d}秒后                         │\n"
+                    else:
+                        status_text += "│     下次优化:      随时可以                            │\n"
+                else:
+                    status_text += "│  🎮 检测到游戏:    暂无                                │\n"
+                    status_text += "│     智能优化:      ⏳ 等待中                            │\n"
+                    status_text += "│     启动游戏后将自动优化相关进程                        │\n"
+            
+            status_text += "└──────────────────────────────────────────────────────────┘\n"
+            
+            # 打印到控制台
+            print("\n" + status_text)
+            
+            # 显示消息框
+            try:
+                import tkinter as tk
+                from tkinter import messagebox
+                root = tk.Tk()
+                root.withdraw()
+                # 简化消息框内容（太长会影响显示）
+                msg_text = f"智优进程管理器 v1.1.0\n\n"
+                msg_text += f"CPU: {system_metrics['cpu_percent']}% ({system_metrics['cpu_count']}核)\n"
+                msg_text += f"内存: {system_metrics['memory_percent']}%\n"
+                msg_text += f"可用内存: {system_metrics['memory_available']:.1f} GB\n"
+                if system_metrics['gpus']:
+                    msg_text += "\nGPU:"
+                    for i, gpu in enumerate(system_metrics['gpus']):
+                        msg_text += f"\n  GPU {i+1}: {gpu['name']} - {gpu['utilization']}%"
+                msg_text += "\n\n游戏检测: " + ("✅ 运行中" if has_games else "⏳ 等待中")
+                messagebox.showinfo("系统状态", msg_text)
+                root.destroy()
+            except ImportError:
+                pass
+                
+        except Exception as e:
+            logger.error(f"显示状态失败: {e}")
+    
+    thread = threading.Thread(target=_show_status, daemon=True)
+    thread.start()
+
+def run_optimization():
+    """执行进程优化 - 在单独线程中执行"""
+    def _run_optimization():
+        # 精美的优化开始提示
+        start_text = "╔══════════════════════════════════════════════════════════╗\n"
+        start_text += "║              正在执行进程优先级优化...                   ║\n"
+        start_text += "╚══════════════════════════════════════════════════════════╝\n"
+        print(start_text)
+        
+        try:
+            results = analyze_all_processes()
+            success_count = sum(1 for r in results if r.get('status') == 'success')
+            
+            # 精美的优化结果
+            result_text = "╔══════════════════════════════════════════════════════════╗\n"
+            result_text += "║              进程优先级优化完成                          ║\n"
+            result_text += "╚══════════════════════════════════════════════════════════╝\n\n"
+            result_text += "┌──────────────────────────────────────────────────────────┐\n"
+            result_text += f"│  ✅ 成功优化:      {success_count:4d} 个进程                 │\n"
+            result_text += f"│  📊 总计分析:      {len(results):4d} 个进程                 │\n"
+            result_text += f"│  🎯 优化成功率:    {(success_count/len(results)*100):6.1f}%            │\n"
+            result_text += "└──────────────────────────────────────────────────────────┘\n"
+            result_text += "\n优化完成！系统资源已智能分配。"
+            
+            # 打印到控制台
+            print(result_text)
+            
+            # 显示消息框
+            try:
+                import tkinter as tk
+                from tkinter import messagebox
+                root = tk.Tk()
+                root.withdraw()
+                msg_text = f"进程优先级优化完成\n\n"
+                msg_text += f"✅ 成功优化: {success_count} 个进程\n"
+                msg_text += f"📊 总计分析: {len(results)} 个进程\n"
+                msg_text += f"\n系统资源已智能分配，游戏体验更流畅！"
+                messagebox.showinfo("优化完成", msg_text)
+                root.destroy()
+            except ImportError:
+                pass
+                
+        except Exception as e:
+            error_text = "╔══════════════════════════════════════════════════════════╗\n"
+            error_text += "║                 优化失败                                 ║\n"
+            error_text += "╚══════════════════════════════════════════════════════════╝\n"
+            error_text += f"\n错误: {e}"
+            print(error_text)
+            logger.error(f"优化失败: {e}")
+    
+    thread = threading.Thread(target=_run_optimization, daemon=True)
+    thread.start()
+
+def show_services():
+    """显示服务状态 - 在单独线程中执行"""
+    def _show_services():
+        # 精美的服务状态提示
+        start_text = "╔══════════════════════════════════════════════════════════╗\n"
+        start_text += "║              正在查询Windows服务状态...                  ║\n"
+        start_text += "╚══════════════════════════════════════════════════════════╝\n"
+        print(start_text)
+        
+        try:
+            services = analyze_all_services()
+            running_count = sum(1 for s in services if s['is_running'])
+            stopped_count = len(services) - running_count
+            
+            # 精美的服务状态文本
+            result_text = "╔══════════════════════════════════════════════════════════╗\n"
+            result_text += "║               Windows 服务状态                          ║\n"
+            result_text += "╚══════════════════════════════════════════════════════════╝\n\n"
+            result_text += "┌──────────────────────────────────────────────────────────┐\n"
+            result_text += f"│  📊 总计服务:      {len(services):4d} 个                     │\n"
+            result_text += f"│  ✅ 运行中:        {running_count:4d} 个                     │\n"
+            result_text += f"│  ⏹️  已停止:       {stopped_count:4d} 个                     │\n"
+            result_text += "└──────────────────────────────────────────────────────────┘\n"
+            result_text += "\n服务状态查询完成！"
+            
+            # 打印到控制台
+            print(result_text)
+            
+            # 显示消息框
+            try:
+                import tkinter as tk
+                from tkinter import messagebox
+                root = tk.Tk()
+                root.withdraw()
+                msg_text = f"Windows服务状态\n\n"
+                msg_text += f"📊 总计服务: {len(services)} 个\n"
+                msg_text += f"✅ 运行中:   {running_count} 个\n"
+                msg_text += f"⏹️  已停止:  {stopped_count} 个"
+                messagebox.showinfo("服务状态", msg_text)
+                root.destroy()
+            except ImportError:
+                pass
+                
+        except Exception as e:
+            error_text = "╔══════════════════════════════════════════════════════════╗\n"
+            error_text += "║                 查询服务失败                             ║\n"
+            error_text += "╚══════════════════════════════════════════════════════════╝\n"
+            error_text += f"\n错误: {e}"
+            print(error_text)
+            logger.error(f"显示服务失败: {e}")
+    
+    thread = threading.Thread(target=_show_services, daemon=True)
+    thread.start()
+
+def run_tray_service():
+    """启动系统托盘服务"""
+    try:
+        # 设置日志 - 用户模式
+        setup_logging(verbose=False)
+        
+        print("╔══════════════════════════════════════════════════════════╗")
+        print("║           智优进程管理器 v1.1.0 - 启动中                 ║")
+        print("╚══════════════════════════════════════════════════════════╝")
+        
+        # 初始化应用
+        APP.initialize()
+        print("✅ 应用初始化完成")
+        
+        # 创建托盘菜单
+        menu = pystray.Menu(
+            pystray.MenuItem("查看状态", on_tray_click),
+            pystray.MenuItem("查看游戏", on_tray_click),
+            pystray.MenuItem("立即优化", on_tray_click),
+            pystray.MenuItem("查看服务", on_tray_click),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("退出", on_tray_click)
+        )
+        print("✅ 托盘菜单创建完成")
+        
+        # 创建图标
+        tray_icon = create_tray_icon()
+        print("✅ 托盘图标创建完成")
+        
+        # 创建托盘图标
+        icon = pystray.Icon(
+            name=APP_DISPLAY_NAME,
+            icon=tray_icon,
+            title=f"{APP_DISPLAY_NAME} {APP_VERSION}\n智能游戏优化已启用"
+        )
+        icon.menu = menu
+        
+        # 启动定时任务
+        APP.start_scheduler()
+        print("✅ 定时任务启动成功")
+        
+        print("\n╔══════════════════════════════════════════════════════════╗")
+        print("║           智优进程管理器 v1.1.0 已启动                   ║")
+        print("║           智能游戏检测已启用                             ║")
+        print("╚══════════════════════════════════════════════════════════╝")
+        print("\n右键点击托盘图标查看菜单")
+        
+        # 运行托盘事件循环
+        icon.run()
+        
+    except Exception as e:
+        print(f"\n❌ 启动失败: {e}")
+        import traceback
+        traceback.print_exc()
+        input("按回车键退出...")
+
+
 def main():
     start_time = time.time()
     log_entries = []
     config = load_config()
     
+    APP.initialize()
+    
+    global CONFIG_MANAGER, ML_MODEL, HISTORY_MANAGER, PERF_COUNTER, NETWORK_MONITOR
+    CONFIG_MANAGER = APP.config_manager
+    ML_MODEL = APP.ml_model
+    HISTORY_MANAGER = APP.history_manager
+    PERF_COUNTER = APP.perf_counter
+    NETWORK_MONITOR = APP.network_monitor
+    
     admin_mode = is_admin()
+    
+    # 性能模式处理（需要在其他参数之前处理）
+    global PERFORMANCE_MODE
+    for arg in sys.argv[1:]:
+        if arg in ('--fast', '--balanced', '--thorough'):
+            PERFORMANCE_MODE = arg[2:]  # 去掉 '--'
+            print(f"[性能模式] {PERFORMANCE_MODE} 模式已启用")
+            log_entries.append(f"性能模式: {PERFORMANCE_MODE}")
+            break
     
     if len(sys.argv) > 1:
         if sys.argv[1] == '--config':
-            show_gpu_config_menu(config)
+            show_advanced_menu(config)
             return
-    
+        elif sys.argv[1] == '--report':
+            if HISTORY_MANAGER:
+                print(HISTORY_MANAGER.get_report_summary_text())
+            else:
+                print("历史管理器不可用")
+            return
+        elif sys.argv[1] == '--perf':
+            if PERF_COUNTER:
+                print(PERF_COUNTER.get_formatted_metrics())
+            else:
+                print("性能计数器不可用")
+            return
+        elif sys.argv[1] == '--ml-train':
+            if ML_MODEL and HISTORY_MANAGER:
+                data = ML_MODEL.prepare_training_data(HISTORY_MANAGER)
+                result = ML_MODEL.train_model(data)
+                print("ML模型训练结果:")
+                print(json.dumps(result, indent=2, ensure_ascii=False))
+            else:
+                print("ML模型或历史管理器不可用")
+            return
+        elif sys.argv[1] == '--ml-info':
+            if ML_MODEL:
+                info = ML_MODEL.get_model_info()
+                print("ML模型信息:")
+                print(json.dumps(info, indent=2, ensure_ascii=False))
+            else:
+                print("ML模型不可用")
+            return
+        elif sys.argv[1] == '--api':
+            port = int(sys.argv[2]) if len(sys.argv) > 2 else 5000
+            start_api_server(port)
+            return
+
     print("=" * 90)
-    print("          AI 智能进程优先级分配 v7.0")
+    print("          AI 智能进程优先级分配 v1.1.0")
     print("=" * 90)
     
-    log_entries.append(f"版本: v7.0")
+    log_entries.append(f"版本: v1.1.0")
     log_entries.append(f"管理员模式: {admin_mode}")
     
     if admin_mode:
@@ -1680,7 +3348,11 @@ def main():
     else:
         print("[普通模式] 部分系统进程需要管理员权限")
     
+    # 显示当前性能模式
+    print(f"[性能模式] 当前模式: {PERFORMANCE_MODE}")
+    
     print(f"\n[提示] 使用 python {sys.argv[0]} --config 进入配置管理")
+    print(f"[提示] 性能模式选项: --fast(快速) --balanced(平衡) --thorough(彻底)")
     
     keyword = None
     for arg in sys.argv[1:]:
@@ -1880,6 +3552,13 @@ def main():
         print("  如果你做影视剪辑、做图、玩游戏 → 用 NVIDIA/AMD/Intel Arc 独立显卡")
         print("  如果你只是上网、办公 → 用 Intel UHD 集成显卡就够了")
     
+    if HISTORY_MANAGER:
+        try:
+            HISTORY_MANAGER.record_process_snapshot(results)
+            HISTORY_MANAGER.clean_old_data()
+        except Exception as e:
+            print(f"\n[历史记录保存失败] {e}")
+    
     if write_log(log_entries):
         print(f"\n[日志已保存] {LOG_FILE}")
     else:
@@ -1891,5 +3570,935 @@ def main():
     
     print("=" * 90)
 
+def run_web_server():
+    if not FLASK_AVAILABLE:
+        print("\n❌ Flask 未安装，请安装 Flask: pip install flask")
+        return
+    
+    APP.initialize()
+    APP.start_scheduler()
+    
+    global CONFIG_MANAGER, ML_MODEL, HISTORY_MANAGER, PERF_COUNTER, NETWORK_MONITOR
+    CONFIG_MANAGER = APP.config_manager
+    ML_MODEL = APP.ml_model
+    HISTORY_MANAGER = APP.history_manager
+    PERF_COUNTER = APP.perf_counter
+    NETWORK_MONITOR = APP.network_monitor
+    
+    app = Flask(__name__)
+    
+    WEB_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI进程优先级管理器</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { 
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', sans-serif; 
+            background: linear-gradient(135deg, #0f0f23 0%, #1a1a3e 50%, #0d1b2a 100%); 
+            min-height: 100vh; 
+            color: #ffffff;
+            background-attachment: fixed;
+        }
+        .header { 
+            background: rgba(0, 0, 0, 0.4);
+            backdrop-filter: blur(20px);
+            padding: 1.25rem 2.5rem; 
+            display: flex; 
+            justify-content: space-between; 
+            align-items: center;
+            box-shadow: 0 4px 30px rgba(0, 0, 0, 0.3);
+            position: sticky;
+            top: 0;
+            z-index: 500;
+        }
+        .header h1 { 
+            font-size: 1.75rem; 
+            background: linear-gradient(90deg, #00d4ff, #7c3aed, #f093fb); 
+            -webkit-background-clip: text; 
+            -webkit-text-fill-color: transparent;
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+            font-weight: 700;
+        }
+        .header .version {
+            font-size: 0.75rem;
+            opacity: 0.5;
+            font-weight: 400;
+        }
+        .header .status { 
+            padding: 0.625rem 1.25rem; 
+            border-radius: 25px; 
+            font-size: 0.875rem;
+            font-weight: 600;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            transition: all 0.3s ease;
+        }
+        .header .status.admin { 
+            background: linear-gradient(135deg, #10b981, #059669); 
+            color: #ffffff;
+            box-shadow: 0 0 20px rgba(16, 185, 129, 0.4);
+        }
+        .header .status.normal { 
+            background: linear-gradient(135deg, #f59e0b, #d97706); 
+            color: #ffffff;
+            box-shadow: 0 0 20px rgba(245, 158, 11, 0.4);
+        }
+        .container { 
+            padding: 2.5rem; 
+            max-width: 1600px; 
+            margin: 0 auto; 
+        }
+        .stats-grid { 
+            display: grid; 
+            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); 
+            gap: 1.5rem; 
+            margin-bottom: 2.5rem; 
+        }
+        .stat-card { 
+            background: linear-gradient(145deg, rgba(255, 255, 255, 0.06), rgba(255, 255, 255, 0.02));
+            backdrop-filter: blur(10px);
+            border-radius: 20px; 
+            padding: 2rem; 
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            transition: all 0.3s ease;
+            position: relative;
+            overflow: hidden;
+        }
+        .stat-card::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 4px;
+            height: 100%;
+        }
+        .stat-card.cpu::before { background: linear-gradient(180deg, #00d4ff, #3b82f6); }
+        .stat-card.memory::before { background: linear-gradient(180deg, #7c3aed, #8b5cf6); }
+        .stat-card.process::before { background: linear-gradient(180deg, #10b981, #059669); }
+        .stat-card.disk::before { background: linear-gradient(180deg, #f59e0b, #d97706); }
+        .stat-card:hover {
+            transform: translateY(-4px);
+            box-shadow: 0 15px 40px rgba(0, 0, 0, 0.35);
+        }
+        .stat-card .value { 
+            font-size: 2.75rem; 
+            font-weight: 700; 
+            background: linear-gradient(90deg, #00d4ff, #7c3aed);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            margin-bottom: 0.5rem;
+        }
+        .stat-card .label { 
+            font-size: 1rem; 
+            opacity: 0.7; 
+            color: rgba(255, 255, 255, 0.7);
+            font-weight: 500;
+        }
+        .search-bar { 
+            display: flex; 
+            gap: 1rem; 
+            margin-bottom: 2.5rem;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+        .search-bar input { 
+            flex: 1; 
+            min-width: 280px;
+            padding: 1rem 1.25rem; 
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 14px; 
+            background: rgba(255, 255, 255, 0.05); 
+            color: #ffffff; 
+            font-size: 1rem;
+            transition: all 0.3s ease;
+            outline: none;
+        }
+        .search-bar input:focus {
+            border-color: #00d4ff;
+            box-shadow: 0 0 25px rgba(0, 212, 255, 0.2);
+            background: rgba(255, 255, 255, 0.08);
+        }
+        .search-bar input::placeholder {
+            color: rgba(255, 255, 255, 0.4);
+        }
+        .search-bar select {
+            padding: 1rem 1.25rem;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 14px;
+            background: rgba(255, 255, 255, 0.05);
+            color: #ffffff;
+            font-size: 1rem;
+            cursor: pointer;
+            min-width: 160px;
+            transition: all 0.3s ease;
+            outline: none;
+        }
+        .search-bar select:focus {
+            border-color: #00d4ff;
+            box-shadow: 0 0 25px rgba(0, 212, 255, 0.2);
+        }
+        .search-bar select option {
+            background: #1a1a2e;
+            color: #ffffff;
+        }
+        .search-bar button { 
+            padding: 1rem 2rem; 
+            border: none; 
+            border-radius: 14px; 
+            background: linear-gradient(90deg, #00d4ff, #7c3aed); 
+            color: #ffffff; 
+            font-weight: 600; 
+            cursor: pointer;
+            font-size: 1rem;
+            transition: all 0.3s ease;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            white-space: nowrap;
+        }
+        .search-bar button:hover { 
+            transform: translateY(-2px);
+            box-shadow: 0 8px 25px rgba(0, 212, 255, 0.4);
+        }
+        .search-bar button.auto {
+            background: linear-gradient(90deg, #10b981, #059669);
+        }
+        .search-bar button.auto:hover {
+            box-shadow: 0 8px 25px rgba(16, 185, 129, 0.4);
+        }
+        .process-table-wrapper {
+            background: linear-gradient(145deg, rgba(255, 255, 255, 0.04), rgba(255, 255, 255, 0.02));
+            backdrop-filter: blur(10px);
+            border-radius: 20px;
+            overflow: hidden;
+            border: 1px solid rgba(255, 255, 255, 0.06);
+            box-shadow: 0 10px 40px rgba(0, 0, 0, 0.25);
+        }
+        .process-table { 
+            width: 100%; 
+            border-collapse: collapse; 
+        }
+        .process-table th, .process-table td { 
+            padding: 1.25rem 1.5rem; 
+            text-align: left; 
+            border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+        }
+        .process-table th { 
+            background: rgba(0, 0, 0, 0.15); 
+            font-weight: 600;
+            font-size: 0.95rem;
+            color: rgba(255, 255, 255, 0.8);
+            cursor: pointer;
+            position: relative;
+            transition: all 0.2s ease;
+        }
+        .process-table th:hover {
+            background: rgba(0, 0, 0, 0.25);
+        }
+        .process-table th.sortable::after {
+            content: ' ↕';
+            font-size: 0.7rem;
+            opacity: 0.4;
+            margin-left: 0.25rem;
+        }
+        .process-table tr {
+            transition: all 0.2s ease;
+        }
+        .process-table tr:hover { 
+            background: rgba(255, 255, 255, 0.04);
+            transform: scale(1.002);
+        }
+        .priority { 
+            padding: 0.5rem 1.125rem; 
+            border-radius: 10px; 
+            font-size: 0.85rem; 
+            font-weight: 700;
+            text-align: center;
+            min-width: 90px;
+            display: inline-block;
+        }
+        .priority.high { 
+            background: linear-gradient(135deg, #ef4444, #dc2626); 
+            box-shadow: 0 3px 12px rgba(239, 68, 68, 0.4);
+        }
+        .priority.above { 
+            background: linear-gradient(135deg, #f59e0b, #d97706); 
+            box-shadow: 0 3px 12px rgba(245, 158, 11, 0.4);
+        }
+        .priority.normal { 
+            background: linear-gradient(135deg, #10b981, #059669); 
+            box-shadow: 0 3px 12px rgba(16, 185, 129, 0.4);
+        }
+        .priority.below { 
+            background: linear-gradient(135deg, #6b7280, #4b5563); 
+        }
+        .priority.idle { 
+            background: linear-gradient(135deg, #374151, #1f2937); 
+        }
+        .btn { 
+            padding: 0.625rem 1.375rem; 
+            border: none; 
+            border-radius: 10px; 
+            cursor: pointer; 
+            font-size: 0.9rem;
+            font-weight: 600;
+            transition: all 0.25s ease;
+        }
+        .btn.up { 
+            background: linear-gradient(135deg, #10b981, #059669); 
+            color: #ffffff; 
+        }
+        .btn.up:hover {
+            box-shadow: 0 4px 15px rgba(16, 185, 129, 0.5);
+            transform: translateY(-1px);
+        }
+        .btn.down { 
+            background: linear-gradient(135deg, #ef4444, #dc2626); 
+            color: #ffffff; 
+        }
+        .btn.down:hover {
+            box-shadow: 0 4px 15px rgba(239, 68, 68, 0.5);
+            transform: translateY(-1px);
+        }
+        .btn.cancel { 
+            background: rgba(255, 255, 255, 0.1); 
+            color: #ffffff; 
+        }
+        .btn.cancel:hover {
+            background: rgba(255, 255, 255, 0.15);
+        }
+        .modal { 
+            display: none; 
+            position: fixed; 
+            top: 0; 
+            left: 0; 
+            width: 100%; 
+            height: 100%; 
+            background: rgba(0, 0, 0, 0.85);
+            backdrop-filter: blur(10px);
+            justify-content: center; 
+            align-items: center; 
+            z-index: 1000;
+            animation: fadeIn 0.25s ease;
+        }
+        @keyframes fadeIn {
+            from { opacity: 0; }
+            to { opacity: 1; }
+        }
+        .modal.active { display: flex; }
+        .modal-content { 
+            background: linear-gradient(145deg, #1a1a2e, #16213e);
+            padding: 2.5rem; 
+            border-radius: 24px; 
+            min-width: 480px;
+            box-shadow: 0 25px 80px rgba(0, 0, 0, 0.5);
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            animation: slideUp 0.35s ease;
+            position: relative;
+        }
+        @keyframes slideUp {
+            from { transform: translateY(30px); opacity: 0; }
+            to { transform: translateY(0); opacity: 1; }
+        }
+        .modal-content h3 { 
+            margin-bottom: 1.5rem; 
+            font-size: 1.5rem;
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+            color: #ffffff;
+        }
+        .modal-content label { 
+            display: block; 
+            margin-bottom: 0.875rem;
+            font-weight: 600;
+            color: rgba(255, 255, 255, 0.9);
+            font-size: 1rem;
+        }
+        .modal-content select { 
+            width: 100%; 
+            padding: 1rem 1.25rem; 
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 12px; 
+            background: rgba(255, 255, 255, 0.05); 
+            color: #ffffff; 
+            font-size: 1rem;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            outline: none;
+        }
+        .modal-content select:focus {
+            border-color: #00d4ff;
+            box-shadow: 0 0 25px rgba(0, 212, 255, 0.2);
+        }
+        .modal-content select option {
+            background: #1a1a2e;
+            color: #ffffff;
+        }
+        .modal-content .buttons { 
+            display: flex; 
+            gap: 1rem; 
+            margin-top: 2rem; 
+        }
+        .modal-content .btn { 
+            flex: 1; 
+            padding: 1rem;
+            font-size: 1rem;
+        }
+        .modal-content .process-info {
+            margin-bottom: 1.5rem;
+            padding: 1rem 1.25rem;
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 12px;
+            font-size: 0.95rem;
+        }
+        .modal-content .process-info span {
+            opacity: 0.6;
+            margin-right: 0.5rem;
+        }
+        .modal-content .tip {
+            margin-top: 1.25rem;
+            padding: 1rem 1.25rem;
+            background: rgba(0, 212, 255, 0.1);
+            border-radius: 10px;
+            font-size: 0.875rem;
+            opacity: 0.85;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+        .loading { 
+            text-align: center; 
+            padding: 4rem; 
+            color: #00d4ff;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 1.5rem;
+        }
+        .loading::before {
+            content: '';
+            width: 48px;
+            height: 48px;
+            border: 3px solid rgba(0, 212, 255, 0.2);
+            border-top-color: #00d4ff;
+            border-radius: 50%;
+            animation: spin 0.9s linear infinite;
+        }
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+        .notification {
+            position: fixed;
+            bottom: 2.5rem;
+            right: 2.5rem;
+            padding: 1.25rem 1.75rem;
+            border-radius: 14px;
+            color: #ffffff;
+            font-weight: 600;
+            z-index: 2000;
+            animation: slideIn 0.35s ease;
+            box-shadow: 0 12px 40px rgba(0, 0, 0, 0.4);
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+        }
+        @keyframes slideIn {
+            from { transform: translateX(120px); opacity: 0; }
+            to { transform: translateX(0); opacity: 1; }
+        }
+        .notification.success {
+            background: linear-gradient(135deg, #10b981, #059669);
+        }
+        .notification.error {
+            background: linear-gradient(135deg, #ef4444, #dc2626);
+        }
+        .notification.info {
+            background: linear-gradient(135deg, #00d4ff, #3b82f6);
+        }
+        .type-badge {
+            padding: 0.375rem 0.875rem;
+            border-radius: 6px;
+            font-size: 0.8rem;
+            font-weight: 600;
+            background: rgba(255, 255, 255, 0.1);
+            color: rgba(255, 255, 255, 0.9);
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>🤖 AI进程优先级管理器<span class="version">v8.3</span></h1>
+        <span class="status {{ 'admin' if admin_mode_str == 'true' else 'normal' }}">
+            {{ '🛡️ 管理员模式' if admin_mode_str == 'true' else '🔒 普通模式' }}
+        </span>
+    </div>
+    
+    <div class="container">
+        <div class="stats-grid">
+            <div class="stat-card process">
+                <div class="value">{{ total_processes }}</div>
+                <div class="label">总进程数</div>
+            </div>
+            <div class="stat-card cpu">
+                <div class="value">{{ cpu_percent }}%</div>
+                <div class="label">CPU使用率</div>
+            </div>
+            <div class="stat-card memory">
+                <div class="value">{{ memory_percent }}%</div>
+                <div class="label">内存使用率</div>
+            </div>
+            <div class="stat-card disk">
+                <div class="value">{{ disk_percent }}%</div>
+                <div class="label">磁盘使用率</div>
+            </div>
+        </div>
+        
+        <div class="search-bar">
+            <input type="text" id="searchInput" placeholder="🔍 搜索进程名称..." onkeyup="filterTable()">
+            <select id="typeFilter" onchange="filterTable()">
+                <option value="">全部类型</option>
+                <option value="game">🎮 游戏</option>
+                <option value="video">🎬 视频/渲染</option>
+                <option value="system">⚙️ 系统</option>
+                <option value="office">📊 办公</option>
+                <option value="unknown">❓ 未知</option>
+            </select>
+            <button onclick="refreshProcesses()">🔄 刷新</button>
+            <button onclick="autoOptimize()">🤖 自动优化</button>
+        </div>
+        
+        <div class="loading" id="loading" style="display: none;">正在分析进程...</div>
+        
+        <div class="process-table-wrapper">
+            <table class="process-table" id="processTable">
+                <thead>
+                    <tr>
+                        <th class="sortable" onclick="sortTable('pid')">PID</th>
+                        <th class="sortable" onclick="sortTable('name')">名称</th>
+                        <th class="sortable" onclick="sortTable('type')">类型</th>
+                        <th class="sortable" onclick="sortTable('cpu')">CPU%</th>
+                        <th class="sortable" onclick="sortTable('memory')">内存%</th>
+                        <th class="sortable" onclick="sortTable('threads')">线程</th>
+                        <th class="sortable" onclick="sortTable('score')">评分</th>
+                        <th>优先级</th>
+                        <th>操作</th>
+                    </tr>
+                </thead>
+                <tbody id="processBody">
+                </tbody>
+            </table>
+        </div>
+    </div>
+    
+    <div class="modal" id="priorityModal">
+        <div class="modal-content">
+            <h3>⚙️ 设置优先级</h3>
+            <input type="hidden" id="modalPid">
+            <input type="hidden" id="modalProcessName">
+            <div class="process-info">
+                <span>目标进程:</span>
+                <span id="modalProcessDisplay" style="font-weight: 600;"></span>
+            </div>
+            <label>选择优先级:</label>
+            <select id="prioritySelect">
+                <option value="high">🔴 高 (H)</option>
+                <option value="above_normal">🟠 高于正常 (A)</option>
+                <option value="normal">🟢 正常 (N)</option>
+                <option value="below_normal">⬜ 低于正常 (B)</option>
+                <option value="idle">⚫ 空闲 (I)</option>
+            </select>
+            <div class="tip">💡 优先级更改后，部分应用可能需要重启才能生效</div>
+            <div class="buttons">
+                <button class="btn cancel" onclick="closeModal()">取消</button>
+                <button class="btn" onclick="setPriority()">确定</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let processes = [];
+        
+        async function loadProcesses() {
+            document.getElementById('loading').style.display = 'block';
+            document.getElementById('processTable').style.display = 'none';
+            const tbody = document.getElementById('processBody');
+            tbody.innerHTML = '';
+            
+            try {
+                const response = await fetch('/api/processes');
+                if (!response.ok) {
+                    throw new Error('网络请求失败');
+                }
+                const data = await response.json();
+                processes = data.processes || [];
+                console.log('加载到进程数:', processes.length);
+                renderTable();
+            } catch (error) {
+                console.error('加载失败:', error);
+                tbody.innerHTML = '<tr><td colspan="9" style="text-align:center;color:#ef4444;">加载进程失败</td></tr>';
+            }
+            
+            document.getElementById('loading').style.display = 'none';
+            document.getElementById('processTable').style.display = 'table';
+        }
+        
+        function renderTable(filter = '', typeFilter = '') {
+            const tbody = document.getElementById('processBody');
+            
+            if (!processes || processes.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="9" style="text-align:center;color:#f59e0b;padding:2rem;">暂无进程数据，请点击刷新按钮</td></tr>';
+                return;
+            }
+            
+            let filtered = processes.filter(p => 
+                p.name && p.name.toLowerCase().includes(filter.toLowerCase())
+            );
+            
+            if (typeFilter && typeFilter !== '') {
+                filtered = filtered.filter(p => p.type === typeFilter);
+            }
+            
+            filtered.sort((a, b) => {
+                let aVal = a[sortField];
+                let bVal = b[sortField];
+                
+                if (typeof aVal === 'string') aVal = aVal.toLowerCase();
+                if (typeof bVal === 'string') bVal = bVal.toLowerCase();
+                
+                if (sortOrder === 'asc') {
+                    return aVal > bVal ? 1 : -1;
+                } else {
+                    return aVal < bVal ? 1 : -1;
+                }
+            });
+            
+            if (filtered.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="9" style="text-align:center;color:#6b7280;padding:2rem;">未找到匹配的进程</td></tr>';
+                return;
+            }
+            
+            const totalPages = Math.ceil(filtered.length / pageSize);
+            const start = (currentPage - 1) * pageSize;
+            const end = start + pageSize;
+            const pageData = filtered.slice(start, end);
+            
+            const getTypeLabel = (type) => {
+                const labels = {
+                    'game': '🎮 游戏',
+                    'video': '🎬 视频',
+                    'system': '⚙️ 系统',
+                    'office': '📊 办公',
+                    'unknown': '❓ 未知'
+                };
+                return labels[type] || '❓ 未知';
+            };
+            
+            tbody.innerHTML = pageData.map(p => {
+                const cpu = typeof p.cpu === 'number' ? p.cpu.toFixed(1) : '0.0';
+                const memory = typeof p.memory === 'number' ? p.memory.toFixed(1) : '0.0';
+                const score = typeof p.score === 'number' ? p.score.toFixed(1) : '0.0';
+                
+                return `
+                <tr>
+                    <td style="font-family: monospace; font-weight: 600;">${p.pid || 'N/A'}</td>
+                    <td style="max-width: 250px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${p.name || 'Unknown'}</td>
+                    <td>${getTypeLabel(p.type)}</td>
+                    <td>${cpu}</td>
+                    <td>${memory}</td>
+                    <td>${p.threads || 1}</td>
+                    <td style="font-weight: 600;">${score}</td>
+                    <td><span class="priority ${getPriorityClass(p.priority)}">${p.priority_display || 'N/A'}</span></td>
+                    <td>
+                        <button class="btn up" onclick="openModal(${p.pid})">设置</button>
+                    </td>
+                </tr>
+                `;
+            }).join('');
+        }
+        
+        function getPriorityClass(priority) {
+            const map = { '高(H)': 'high', '高于正常(A)': 'above', '正常(N)': 'normal', '低于正常(B)': 'below', '空闲(I)': 'idle' };
+            return map[priority] || 'normal';
+        }
+        
+        let currentPage = 1;
+        const pageSize = 20;
+        let sortField = 'score';
+        let sortOrder = 'desc';
+        
+        function filterTable() {
+            const filter = document.getElementById('searchInput').value;
+            const typeFilter = document.getElementById('typeFilter').value;
+            currentPage = 1;
+            renderTable(filter, typeFilter);
+        }
+        
+        function sortTable(field) {
+            if (sortField === field) {
+                sortOrder = sortOrder === 'asc' ? 'desc' : 'asc';
+            } else {
+                sortField = field;
+                sortOrder = field === 'score' ? 'desc' : 'asc';
+            }
+            renderTable(document.getElementById('searchInput').value, document.getElementById('typeFilter').value);
+        }
+        
+        function openModal(pid) {
+            const process = processes.find(p => p.pid === pid);
+            document.getElementById('modalPid').value = pid;
+            document.getElementById('modalProcessName').value = process?.name || '';
+            document.getElementById('modalProcessDisplay').textContent = `PID: ${pid} - ${process?.name || '未知进程'}`;
+            document.getElementById('priorityModal').classList.add('active');
+        }
+        
+        function closeModal() {
+            document.getElementById('priorityModal').classList.remove('active');
+        }
+        
+        async function setPriority() {
+            const pid = document.getElementById('modalPid').value;
+            const priority = document.getElementById('prioritySelect').value;
+            
+            try {
+                const response = await fetch(`/api/set_priority/${pid}`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ priority })
+                });
+                const data = await response.json();
+                if (data.success) {
+                    loadProcesses();
+                }
+            } catch (error) {
+                console.error('设置失败:', error);
+            }
+            closeModal();
+        }
+        
+        async function refreshProcesses() {
+            await loadProcesses();
+        }
+        
+        async function autoOptimize() {
+            document.getElementById('loading').style.display = 'block';
+            document.getElementById('processTable').style.display = 'none';
+            
+            try {
+                const response = await fetch('/api/optimize', { method: 'POST' });
+                const data = await response.json();
+                alert(`优化完成! 成功调整: ${data.success} 个进程`);
+            } catch (error) {
+                console.error('优化失败:', error);
+            }
+            
+            await loadProcesses();
+        }
+        
+        document.addEventListener('DOMContentLoaded', loadProcesses);
+    </script>
+</body>
+</html>
+    """
+    
+    @app.route('/')
+    def index():
+        admin_mode = is_admin()
+        system_stats = get_system_stats_for_web()
+        return render_template_string(WEB_TEMPLATE, 
+            admin_mode_str='true' if admin_mode else 'false',
+            total_processes=system_stats['total_processes'],
+            cpu_percent=system_stats['cpu_percent'],
+            memory_percent=system_stats['memory_percent'],
+            disk_percent=system_stats['disk_percent']
+        )
+    
+    def get_process_priority_display(proc):
+        try:
+            priority_value = proc.nice()
+            priority_key = get_priority_key(priority_value)
+            return PRIORITY_DISPLAY.get(priority_key, '未知')
+        except:
+            return '未知'
+    
+    def calculate_score(process_name, cpu_percent, memory_percent, num_threads):
+        score = 50
+        
+        process_name_lower = process_name.lower()
+        
+        proc_type = classify_process(process_name_lower)
+        
+        type_scores = {'game': 70, 'video': 65, 'system': 60, 'office': 50, 'unknown': 45}
+        base_score = type_scores.get(proc_type, 45)
+        
+        score = base_score
+        
+        if cpu_percent > 0:
+            score += min(cpu_percent / 4, 20)
+        if memory_percent > 0:
+            score += min(memory_percent / 4, 15)
+        if num_threads > 4:
+            score += min((num_threads - 4) * 2, 10)
+        
+        type_bonus = {'game': 10, 'video': 8, 'system': 5}
+        score += type_bonus.get(proc_type, 0)
+        
+        return min(max(score, 0), 100)
+    
+    @app.route('/api/processes')
+    def api_processes():
+        processes_data = []
+        try:
+            all_procs = list(psutil.process_iter(['pid', 'name', 'cpu_percent', 'memory_percent', 'num_threads']))
+            print(f"Total processes found: {len(all_procs)}")
+            
+            for proc in all_procs:
+                try:
+                    proc_info = proc.info
+                    if proc_info['name'] and proc_info['pid']:
+                        proc_type = classify_process(proc_info['name'])
+                        cpu_val = float(proc_info['cpu_percent']) if proc_info['cpu_percent'] else 0.0
+                        mem_val = float(proc_info['memory_percent']) if proc_info['memory_percent'] else 0.0
+                        threads_val = int(proc_info['num_threads']) if proc_info['num_threads'] else 1
+                        score = calculate_score(proc_info['name'], cpu_val, mem_val, threads_val)
+                        priority = get_process_priority_display(proc)
+                        
+                        processes_data.append({
+                            'pid': int(proc_info['pid']),
+                            'name': str(proc_info['name']),
+                            'type': str(proc_type),
+                            'cpu': cpu_val,
+                            'memory': mem_val,
+                            'threads': threads_val,
+                            'score': float(score),
+                            'priority': str(priority),
+                            'priority_display': str(priority)
+                        })
+                except Exception as e:
+                    print(f"Process error: {e}")
+                    continue
+            
+            print(f"Processes after filtering: {len(processes_data)}")
+            processes_data.sort(key=lambda x: x['score'], reverse=True)
+        except Exception as e:
+            print(f"API Error: {e}")
+        
+        return jsonify({'processes': processes_data})
+    
+    @app.route('/api/set_priority/<int:pid>', methods=['POST'])
+    def api_set_priority(pid):
+        try:
+            data = request.get_json()
+            priority = data.get('priority')
+            
+            if priority not in PRIORITY_LEVELS:
+                return jsonify({'success': False, 'error': '无效的优先级'})
+            
+            proc = psutil.Process(pid)
+            proc.nice(PRIORITY_LEVELS[priority])
+            return jsonify({'success': True})
+        except Exception as e:
+            return jsonify({'success': False, 'error': str(e)})
+    
+    @app.route('/api/optimize', methods=['POST'])
+    def api_optimize():
+        results = analyze_all_processes()
+        success_count = sum(1 for r in results if r['status'] == 'success')
+        return jsonify({'success': success_count})
+    
+    def get_system_stats_for_web():
+        cpu_percent = psutil.cpu_percent()
+        mem = psutil.virtual_memory()
+        disk = psutil.disk_usage('/')
+        
+        return {
+            'cpu_percent': cpu_percent,
+            'memory_percent': mem.percent,
+            'disk_percent': disk.percent,
+            'total_processes': len(list(psutil.process_iter()))
+        }
+    
+    print("\nWeb服务器启动中...")
+    print("访问地址: http://localhost:5000")
+    print("按 Ctrl+C 停止服务器")
+    app.run(host='0.0.0.0', port=5000, debug=False)
+
+def start_api_server(port=5000):
+    global API_SERVER, CONFIG_MANAGER, ML_MODEL, HISTORY_MANAGER, PERF_COUNTER, NETWORK_MONITOR
+    
+    if not API_AVAILABLE:
+        print("❌ API模块不可用，请安装 flask 和 flask-cors")
+        return
+    
+    try:
+        APP.initialize()
+        
+        CONFIG_MANAGER = APP.config_manager
+        ML_MODEL = APP.ml_model
+        HISTORY_MANAGER = APP.history_manager
+        PERF_COUNTER = APP.perf_counter
+        NETWORK_MONITOR = APP.network_monitor
+        
+        def api_analyze_process(proc, use_ml=False):
+            system_metrics = get_system_metrics()
+            admin_mode = is_admin()
+            config = CONFIG_MANAGER.get_app_categories() if CONFIG_MANAGER else APP_CATEGORIES
+            return analyze_process(proc, system_metrics, admin_mode, config)
+        
+        def api_set_priority(pid, priority):
+            try:
+                proc = psutil.Process(pid)
+                proc.nice(PRIORITY_LEVELS.get(priority, PRIORITY_LEVELS['NORMAL_PRIORITY_CLASS']))
+                return True
+            except Exception:
+                return False
+        
+        API_SERVER = ProcessPriorityAPI(port=port)
+        
+        API_SERVER.set_dependencies(
+            config_manager=CONFIG_MANAGER,
+            history_manager=HISTORY_MANAGER,
+            perf_counter=PERF_COUNTER,
+            network_monitor=NETWORK_MONITOR,
+            ml_model=ML_MODEL,
+            analyze_process_func=api_analyze_process,
+            set_priority_func=api_set_priority,
+            is_admin_func=is_admin
+        )
+        
+        API_SERVER.start()
+        
+        print(f"\n🚀 REST API服务已启动")
+        print(f"访问地址: http://localhost:{port}")
+        print(f"API文档: http://localhost:{port}/api/health")
+        print("按 Ctrl+C 停止服务")
+        
+        while True:
+            time.sleep(1)
+    
+    except ImportError:
+        print("❌ Flask不可用，请安装: pip install flask flask-cors")
+    except Exception as e:
+        print(f"❌ API服务启动失败: {e}")
+
 if __name__ == "__main__":
+    if len(sys.argv) > 1:
+        if sys.argv[1] == '--web':
+            run_web_server()
+            sys.exit(0)
+        elif sys.argv[1] == '--tray':
+            if TRAY_AVAILABLE:
+                run_tray_service()
+            else:
+                print("❌ 系统托盘功能不可用，请安装依赖: pip install pystray pillow")
+                sys.exit(1)
+            sys.exit(0)
+    
     main()
