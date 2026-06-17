@@ -1,0 +1,6 @@
+{"timestamp": "2026-06-13T21:58:16.804693", "level": "\u001b[92mINFO\u001b[0m", "logger": "core.alerting", "message": "告警已触发: warning - Test", "module": "alerting", "function": "trigger_alert", "line": 135}
+{"timestamp": "2026-06-13T21:58:16.805965", "level": "\u001b[92mINFO\u001b[0m", "logger": "core.alerting", "message": "告警已触发: debug - Debug", "module": "alerting", "function": "trigger_alert", "line": 135}
+{"timestamp": "2026-06-13T21:58:16.806404", "level": "\u001b[92mINFO\u001b[0m", "logger": "core.alerting", "message": "告警已触发: info - Info", "module": "alerting", "function": "trigger_alert", "line": 135}
+{"timestamp": "2026-06-13T21:58:16.806878", "level": "\u001b[92mINFO\u001b[0m", "logger": "core.alerting", "message": "告警已触发: warning - Warning", "module": "alerting", "function": "trigger_alert", "line": 135}
+{"timestamp": "2026-06-13T21:58:16.807368", "level": "\u001b[92mINFO\u001b[0m", "logger": "core.alerting", "message": "告警已触发: info - Test Title", "module": "alerting", "function": "trigger_alert", "line": 135}
+{"timestamp": "2026-06-13T21:58:21.007999", "level": "\u001b[92mINFO\u001b[0m", "logger": "core.gpu_manager", "message": "GPU检测完成，共找到 1 个GPU", "module": "gpu_manager", "function": "get_gpu_info", "line": 178}

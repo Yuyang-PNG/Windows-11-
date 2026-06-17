@@ -1,0 +1,132 @@
+version: "1.0"
+description: "跨因素评分规则配置"
+last_updated: "2026-06-10"
+
+factors:
+  - id: gaming_active
+    name: "游戏活跃"
+    category: "gaming"
+    conditions:
+      - field: cpu
+        operator: ">"
+        value: 30
+      - field: memory
+        operator: ">"
+        value: 15
+    logic: OR
+    score_bonus: 10
+    description: "游戏进程活跃时加分"
+
+  - id: gaming_threads
+    name: "游戏多线程"
+    category: "gaming"
+    conditions:
+      - field: threads
+        operator: ">"
+        value: 30
+    logic: AND
+    score_bonus: 5
+    description: "游戏进程线程数多时加分"
+
+  - id: heavy_memory_design
+    name: "设计AI高内存"
+    category: ["design", "ai"]
+    conditions:
+      - field: memory
+        operator: ">"
+        value: 20
+    logic: AND
+    score_bonus: 8
+    description: "设计/AI应用高内存时加分"
+
+  - id: heavy_cpu_design
+    name: "设计AI高CPU"
+    category: ["design", "ai"]
+    conditions:
+      - field: cpu
+        operator: ">"
+        value: 40
+    logic: AND
+    score_bonus: 5
+    description: "设计/AI应用高CPU时加分"
+
+  - id: browser_memory_warning
+    name: "浏览器内存过高"
+    category: "browser"
+    conditions:
+      - field: memory
+        operator: ">"
+        value: 30
+    logic: AND
+    score_bonus: -5
+    description: "浏览器内存过高时减分"
+
+  - id: browser_cpu_active
+    name: "浏览器CPU活跃"
+    category: "browser"
+    conditions:
+      - field: cpu
+        operator: ">"
+        value: 50
+    logic: AND
+    score_bonus: 5
+    description: "浏览器CPU活跃时加分"
+
+  - id: active_user_app
+    name: "活跃用户应用"
+    category: "*"
+    conditions:
+      - field: proc_type
+        operator: "=="
+        value: "user_app"
+      - field: status
+        operator: "=="
+        value: "running"
+    logic: AND
+    score_bonus: 5
+    description: "活跃用户应用加分"
+
+  - id: heavy_compute
+    name: "重度计算"
+    category: "*"
+    conditions:
+      - field: threads
+        operator: ">"
+        value: 50
+      - field: cpu
+        operator: ">"
+        value: 20
+    logic: AND
+    score_bonus: 8
+    description: "重度计算进程加分"
+
+  - id: idle_process
+    name: "空闲进程"
+    category: "*"
+    conditions:
+      - field: cpu
+        operator: "<"
+        value: 2
+      - field: memory
+        operator: "<"
+        value: 2
+      - field: status
+        operator: "=="
+        value: "sleeping"
+    logic: AND
+    score_bonus: -10
+    description: "空闲进程减分"
+
+system_adjustments:
+  - condition:
+      field: system_cpu
+      operator: ">"
+      value: 80
+    adjustment: -8
+    description: "系统CPU过高时整体减分"
+  - condition:
+      field: system_memory
+      operator: ">"
+      value: 90
+    adjustment: -5
+    description: "系统内存过高时整体减分"

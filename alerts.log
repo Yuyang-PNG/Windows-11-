@@ -1,0 +1,6 @@
+[2026-06-13T21:58:16.803927] [WARNING] Test: Test
+[2026-06-13T21:58:16.805607] [DEBUG] Debug: Debug msg
+[2026-06-13T21:58:16.806071] [INFO] Info: Info msg
+[2026-06-13T21:58:16.806556] [WARNING] Warning: Warning msg
+[2026-06-13T21:58:16.807009] [INFO] Test Title: Test Message
+  Details: {'key': 'value'}

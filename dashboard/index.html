@@ -1,0 +1,785 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>进程优先级管理器 - 监控仪表板</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
+            min-height: 100vh;
+            color: #e0e0e0;
+        }
+        
+        .header {
+            background: rgba(255, 255, 255, 0.05);
+            backdrop-filter: blur(10px);
+            padding: 1rem 2rem;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        
+        .header h1 {
+            font-size: 1.5rem;
+            font-weight: 600;
+            background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+        
+        .status-indicator {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+        
+        .status-dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            background: #10b981;
+            animation: pulse 2s infinite;
+        }
+        
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+        
+        .status-text {
+            font-size: 0.875rem;
+            color: #a0a0a0;
+        }
+        
+        .dashboard {
+            padding: 2rem;
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+        
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 1.5rem;
+            margin-bottom: 2rem;
+        }
+        
+        .card {
+            background: rgba(255, 255, 255, 0.05);
+            backdrop-filter: blur(10px);
+            border-radius: 12px;
+            padding: 1.5rem;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            transition: transform 0.2s, box-shadow 0.2s;
+        }
+        
+        .card:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+        }
+        
+        .card-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 1rem;
+        }
+        
+        .card-title {
+            font-size: 0.875rem;
+            color: #a0a0a0;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        
+        .card-value {
+            font-size: 2.5rem;
+            font-weight: 700;
+            margin-bottom: 0.5rem;
+        }
+        
+        .card-subtitle {
+            font-size: 0.875rem;
+            color: #666;
+        }
+        
+        .card-icon {
+            width: 40px;
+            height: 40px;
+            border-radius: 10px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.25rem;
+        }
+        
+        .card-icon.cpu { background: linear-gradient(135deg, #f59e0b 0%, #d97706 100%); }
+        .card-icon.memory { background: linear-gradient(135deg, #8b5cf6 0%, #7c3aed 100%); }
+        .card-icon.disk { background: linear-gradient(135deg, #06b6d4 0%, #0891b2 100%); }
+        .card-icon.process { background: linear-gradient(135deg, #10b981 0%, #059669 100%); }
+        
+        .chart-container {
+            background: rgba(255, 255, 255, 0.05);
+            backdrop-filter: blur(10px);
+            border-radius: 12px;
+            padding: 1.5rem;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            margin-bottom: 2rem;
+        }
+        
+        .chart-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 1.5rem;
+        }
+        
+        .chart-title {
+            font-size: 1.125rem;
+            font-weight: 600;
+        }
+        
+        .chart-legend {
+            display: flex;
+            gap: 1.5rem;
+        }
+        
+        .legend-item {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            font-size: 0.875rem;
+            color: #a0a0a0;
+        }
+        
+        .legend-color {
+            width: 12px;
+            height: 12px;
+            border-radius: 2px;
+        }
+        
+        .legend-color.cpu { background: #f59e0b; }
+        .legend-color.memory { background: #8b5cf6; }
+        .legend-color.disk { background: #06b6d4; }
+        
+        .chart-area {
+            height: 250px;
+            position: relative;
+        }
+        
+        .chart-canvas {
+            width: 100%;
+            height: 100%;
+        }
+        
+        .process-table {
+            background: rgba(255, 255, 255, 0.05);
+            backdrop-filter: blur(10px);
+            border-radius: 12px;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            overflow: hidden;
+        }
+        
+        .table-header {
+            display: grid;
+            grid-template-columns: 80px 1fr 100px 100px 120px 100px;
+            padding: 1rem 1.5rem;
+            background: rgba(255, 255, 255, 0.05);
+            font-weight: 600;
+            font-size: 0.875rem;
+            color: #a0a0a0;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        
+        .table-row {
+            display: grid;
+            grid-template-columns: 80px 1fr 100px 100px 120px 100px;
+            padding: 1rem 1.5rem;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+            transition: background 0.2s;
+        }
+        
+        .table-row:hover {
+            background: rgba(255, 255, 255, 0.05);
+        }
+        
+        .table-row:last-child {
+            border-bottom: none;
+        }
+        
+        .priority-tag {
+            display: inline-block;
+            padding: 0.25rem 0.75rem;
+            border-radius: 20px;
+            font-size: 0.75rem;
+            font-weight: 600;
+            text-transform: uppercase;
+        }
+        
+        .priority-high { background: rgba(239, 68, 68, 0.2); color: #ef4444; }
+        .priority-above_normal { background: rgba(245, 158, 11, 0.2); color: #f59e0b; }
+        .priority-normal { background: rgba(34, 197, 94, 0.2); color: #22c55e; }
+        .priority-below_normal { background: rgba(59, 130, 246, 0.2); color: #3b82f6; }
+        .priority-idle { background: rgba(156, 163, 175, 0.2); color: #9ca3af; }
+        
+        .category-tag {
+            display: inline-block;
+            padding: 0.25rem 0.5rem;
+            border-radius: 4px;
+            font-size: 0.7rem;
+            background: rgba(139, 92, 246, 0.2);
+            color: #a78bfa;
+        }
+        
+        .progress-bar {
+            height: 6px;
+            border-radius: 3px;
+            background: rgba(255, 255, 255, 0.1);
+            overflow: hidden;
+        }
+        
+        .progress-fill {
+            height: 100%;
+            border-radius: 3px;
+            transition: width 0.3s;
+        }
+        
+        .progress-fill.cpu { background: linear-gradient(90deg, #f59e0b, #d97706); }
+        .progress-fill.memory { background: linear-gradient(90deg, #8b5cf6, #7c3aed); }
+        
+        .refresh-btn {
+            background: rgba(139, 92, 246, 0.2);
+            border: 1px solid rgba(139, 92, 246, 0.3);
+            color: #a78bfa;
+            padding: 0.5rem 1rem;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 0.875rem;
+            transition: all 0.2s;
+        }
+        
+        .refresh-btn:hover {
+            background: rgba(139, 92, 246, 0.3);
+        }
+        
+        .ml-status {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            font-size: 0.875rem;
+        }
+        
+        .ml-status.online { color: #10b981; }
+        .ml-status.offline { color: #ef4444; }
+        
+        .scrollable {
+            max-height: 400px;
+            overflow-y: auto;
+        }
+        
+        ::-webkit-scrollbar {
+            width: 6px;
+        }
+        
+        ::-webkit-scrollbar-track {
+            background: rgba(255, 255, 255, 0.05);
+        }
+        
+        ::-webkit-scrollbar-thumb {
+            background: rgba(255, 255, 255, 0.2);
+            border-radius: 3px;
+        }
+        
+        ::-webkit-scrollbar-thumb:hover {
+            background: rgba(255, 255, 255, 0.3);
+        }
+        
+        .modal-overlay {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0, 0, 0, 0.7);
+            backdrop-filter: blur(4px);
+            justify-content: center;
+            align-items: center;
+            z-index: 1000;
+        }
+        
+        .modal-overlay.show {
+            display: flex;
+        }
+        
+        .modal {
+            background: rgba(26, 26, 46, 0.95);
+            border-radius: 12px;
+            padding: 1.5rem;
+            min-width: 400px;
+            max-width: 90%;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+        
+        .modal-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 1rem;
+        }
+        
+        .modal-title {
+            font-size: 1.125rem;
+            font-weight: 600;
+        }
+        
+        .modal-close {
+            background: none;
+            border: none;
+            color: #a0a0a0;
+            font-size: 1.25rem;
+            cursor: pointer;
+        }
+        
+        .form-group {
+            margin-bottom: 1rem;
+        }
+        
+        .form-label {
+            display: block;
+            font-size: 0.875rem;
+            color: #a0a0a0;
+            margin-bottom: 0.5rem;
+        }
+        
+        .form-select {
+            width: 100%;
+            padding: 0.75rem;
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            border-radius: 8px;
+            background: rgba(255, 255, 255, 0.05);
+            color: #e0e0e0;
+            font-size: 0.875rem;
+        }
+        
+        .form-btn {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            border: none;
+            color: white;
+            padding: 0.75rem 1.5rem;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 0.875rem;
+            font-weight: 600;
+            transition: transform 0.2s;
+        }
+        
+        .form-btn:hover {
+            transform: translateY(-1px);
+        }
+        
+        .toast {
+            position: fixed;
+            bottom: 2rem;
+            right: 2rem;
+            background: rgba(16, 185, 129, 0.95);
+            padding: 1rem 1.5rem;
+            border-radius: 8px;
+            color: white;
+            font-size: 0.875rem;
+            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
+            opacity: 0;
+            transform: translateY(20px);
+            transition: all 0.3s;
+        }
+        
+        .toast.show {
+            opacity: 1;
+            transform: translateY(0);
+        }
+        
+        .toast.error {
+            background: rgba(239, 68, 68, 0.95);
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>进程优先级管理器</h1>
+        <div class="status-indicator">
+            <div class="status-dot"></div>
+            <span class="status-text" id="last-update">最后更新: --</span>
+        </div>
+    </div>
+
+    <div class="dashboard">
+        <div class="grid">
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">CPU</span>
+                    <div class="card-icon cpu">CPU</div>
+                </div>
+                <div class="card-value" id="cpu-value">--</div>
+                <div class="progress-bar">
+                    <div class="progress-fill cpu" id="cpu-bar"></div>
+                </div>
+            </div>
+            
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">内存</span>
+                    <div class="card-icon memory">MEM</div>
+                </div>
+                <div class="card-value" id="memory-value">--</div>
+                <div class="progress-bar">
+                    <div class="progress-fill memory" id="memory-bar"></div>
+                </div>
+            </div>
+            
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">磁盘</span>
+                    <div class="card-icon disk">DISK</div>
+                </div>
+                <div class="card-value" id="disk-value">--</div>
+                <div class="card-subtitle" id="disk-info">--</div>
+            </div>
+            
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">进程数</span>
+                    <div class="card-icon process">PROC</div>
+                </div>
+                <div class="card-value" id="process-count">--</div>
+                <div class="card-subtitle">活跃进程</div>
+            </div>
+        </div>
+
+        <div class="chart-container">
+            <div class="chart-header">
+                <span class="chart-title">系统性能趋势</span>
+                <div class="chart-legend">
+                    <div class="legend-item">
+                        <div class="legend-color cpu"></div>
+                        <span>CPU</span>
+                    </div>
+                    <div class="legend-item">
+                        <div class="legend-color memory"></div>
+                        <span>内存</span>
+                    </div>
+                    <div class="legend-item">
+                        <div class="legend-color disk"></div>
+                        <span>磁盘</span>
+                    </div>
+                </div>
+            </div>
+            <div class="chart-area">
+                <canvas class="chart-canvas" id="performance-chart"></canvas>
+            </div>
+        </div>
+
+        <div class="process-table">
+            <div class="table-header">
+                <span>PID</span>
+                <span>进程名称</span>
+                <span>CPU%</span>
+                <span>内存%</span>
+                <span>优先级</span>
+                <span>分类</span>
+            </div>
+            <div class="scrollable" id="process-list">
+            </div>
+        </div>
+    </div>
+
+    <div class="modal-overlay" id="priority-modal">
+        <div class="modal">
+            <div class="modal-header">
+                <span class="modal-title">设置优先级</span>
+                <button class="modal-close" onclick="closeModal()">&times;</button>
+            </div>
+            <div class="form-group">
+                <label class="form-label">进程</label>
+                <div id="modal-process-name" style="color: #e0e0e0; padding: 0.5rem; background: rgba(255,255,255,0.05); border-radius: 4px;"></div>
+            </div>
+            <div class="form-group">
+                <label class="form-label">优先级</label>
+                <select class="form-select" id="priority-select">
+                    <option value="HIGH_PRIORITY_CLASS">高优先级</option>
+                    <option value="ABOVE_NORMAL_PRIORITY_CLASS">高于正常</option>
+                    <option value="NORMAL_PRIORITY_CLASS" selected>正常</option>
+                    <option value="BELOW_NORMAL_PRIORITY_CLASS">低于正常</option>
+                    <option value="IDLE_PRIORITY_CLASS">空闲</option>
+                </select>
+            </div>
+            <button class="form-btn" onclick="applyPriority()">应用</button>
+        </div>
+    </div>
+
+    <div class="toast" id="toast"></div>
+
+    <script>
+        const API_URL = 'http://localhost:5000/api';
+        let processData = [];
+        let chartData = { cpu: [], memory: [], disk: [] };
+        let selectedPid = null;
+
+        function showToast(message, type = 'success') {
+            const toast = document.getElementById('toast');
+            toast.textContent = message;
+            toast.className = `toast show ${type}`;
+            setTimeout(() => {
+                toast.className = 'toast';
+            }, 3000);
+        }
+
+        function formatNumber(num) {
+            return typeof num === 'number' ? num.toFixed(1) : '--';
+        }
+
+        function formatBytes(bytes) {
+            if (bytes === undefined || bytes === null) return '--';
+            const kb = bytes / 1024;
+            const mb = kb / 1024;
+            const gb = mb / 1024;
+            if (gb > 1) return `${gb.toFixed(2)} GB`;
+            if (mb > 1) return `${mb.toFixed(2)} MB`;
+            return `${kb.toFixed(2)} KB`;
+        }
+
+        function getPriorityLabel(priority) {
+            const labels = {
+                'HIGH_PRIORITY_CLASS': 'high',
+                'ABOVE_NORMAL_PRIORITY_CLASS': 'above_normal',
+                'NORMAL_PRIORITY_CLASS': 'normal',
+                'BELOW_NORMAL_PRIORITY_CLASS': 'below_normal',
+                'IDLE_PRIORITY_CLASS': 'idle',
+                'high': 'high',
+                'above_normal': 'above_normal',
+                'normal': 'normal',
+                'below_normal': 'below_normal',
+                'idle': 'idle'
+            };
+            return labels[priority] || 'normal';
+        }
+
+        function renderProcessList() {
+            const container = document.getElementById('process-list');
+            const sorted = [...processData].sort((a, b) => b.cpu_percent - a.cpu_percent);
+            
+            container.innerHTML = sorted.slice(0, 20).map(proc => `
+                <div class="table-row" onclick="openPriorityModal(${proc.pid}, '${proc.name}')">
+                    <span>${proc.pid}</span>
+                    <span style="cursor: pointer; color: #667eea;">${proc.name}</span>
+                    <span>${formatNumber(proc.cpu_percent)}%</span>
+                    <span>${formatNumber(proc.memory_percent)}%</span>
+                    <span><span class="priority-tag priority-${getPriorityLabel(proc.priority)}">${proc.priority_name || 'Normal'}</span></span>
+                    <span><span class="category-tag">${proc.category || 'Unknown'}</span></span>
+                </div>
+            `).join('');
+        }
+
+        function openPriorityModal(pid, name) {
+            selectedPid = pid;
+            document.getElementById('modal-process-name').textContent = `${name} (PID: ${pid})`;
+            document.getElementById('priority-modal').classList.add('show');
+        }
+
+        function closeModal() {
+            document.getElementById('priority-modal').classList.remove('show');
+            selectedPid = null;
+        }
+
+        async function applyPriority() {
+            if (!selectedPid) return;
+            
+            const priority = document.getElementById('priority-select').value;
+            
+            try {
+                const response = await fetch(`${API_URL}/processes/${selectedPid}/priority`, {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ priority })
+                });
+                
+                const result = await response.json();
+                
+                if (result.success) {
+                    showToast('优先级设置成功');
+                    fetchProcesses();
+                } else {
+                    showToast(result.error || '设置失败', 'error');
+                }
+            } catch (error) {
+                showToast('网络错误', 'error');
+            }
+            
+            closeModal();
+        }
+
+        function drawChart() {
+            const canvas = document.getElementById('performance-chart');
+            const ctx = canvas.getContext('2d');
+            
+            const width = canvas.width;
+            const height = canvas.height;
+            
+            ctx.clearRect(0, 0, width, height);
+            
+            ctx.strokeStyle = 'rgba(255, 255, 255, 0.1)';
+            ctx.lineWidth = 1;
+            for (let i = 0; i <= 4; i++) {
+                const y = (height / 4) * i;
+                ctx.beginPath();
+                ctx.moveTo(0, y);
+                ctx.lineTo(width, y);
+                ctx.stroke();
+            }
+            
+            const maxLen = Math.max(chartData.cpu.length, chartData.memory.length, chartData.disk.length);
+            if (maxLen < 2) return;
+            
+            const stepX = width / (maxLen - 1);
+            
+            const drawLine = (data, color) => {
+                if (data.length < 2) return;
+                
+                ctx.beginPath();
+                ctx.strokeStyle = color;
+                ctx.lineWidth = 2;
+                
+                data.forEach((value, index) => {
+                    const x = index * stepX;
+                    const y = height - (value / 100) * height;
+                    if (index === 0) {
+                        ctx.moveTo(x, y);
+                    } else {
+                        ctx.lineTo(x, y);
+                    }
+                });
+                
+                ctx.stroke();
+            };
+            
+            drawLine(chartData.cpu, '#f59e0b');
+            drawLine(chartData.memory, '#8b5cf6');
+            drawLine(chartData.disk, '#06b6d4');
+        }
+
+        async function fetchSystemStats() {
+            try {
+                const response = await fetch(`${API_URL}/system`);
+                const result = await response.json();
+                
+                if (result.success && result.data) {
+                    const data = result.data;
+                    
+                    document.getElementById('cpu-value').textContent = `${formatNumber(data.cpu.percent)}%`;
+                    document.getElementById('cpu-bar').style.width = `${data.cpu.percent}%`;
+                    
+                    document.getElementById('memory-value').textContent = `${formatNumber(data.memory.percent)}%`;
+                    document.getElementById('memory-bar').style.width = `${data.memory.percent}%`;
+                    
+                    document.getElementById('disk-value').textContent = `${formatNumber(data.disk.percent)}%`;
+                    document.getElementById('disk-info').textContent = `${formatBytes(data.disk.free)} 可用`;
+                    
+                    chartData.cpu.push(data.cpu.percent);
+                    chartData.memory.push(data.memory.percent);
+                    chartData.disk.push(data.disk.percent);
+                    
+                    if (chartData.cpu.length > 50) {
+                        chartData.cpu.shift();
+                        chartData.memory.shift();
+                        chartData.disk.shift();
+                    }
+                    
+                    drawChart();
+                }
+            } catch (error) {
+                console.error('Failed to fetch system stats:', error);
+            }
+        }
+
+        async function fetchProcesses() {
+            try {
+                const response = await fetch(`${API_URL}/processes`);
+                const result = await response.json();
+                
+                if (result.success && result.data) {
+                    processData = result.data;
+                    document.getElementById('process-count').textContent = result.count;
+                    renderProcessList();
+                }
+            } catch (error) {
+                console.error('Failed to fetch processes:', error);
+            }
+        }
+
+        async function fetchAnalysis() {
+            try {
+                const response = await fetch(`${API_URL}/analyze`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ use_ml: false })
+                });
+                const result = await response.json();
+                
+                if (result.success && result.data) {
+                    result.data.forEach(analyzed => {
+                        const proc = processData.find(p => p.pid === analyzed.pid);
+                        if (proc) {
+                            proc.category = analyzed.category;
+                            proc.priority = analyzed.priority;
+                            proc.priority_name = analyzed.priority_name;
+                        }
+                    });
+                    renderProcessList();
+                }
+            } catch (error) {
+                console.error('Failed to fetch analysis:', error);
+            }
+        }
+
+        function updateLastUpdate() {
+            const now = new Date();
+            const timeStr = now.toLocaleTimeString('zh-CN');
+            document.getElementById('last-update').textContent = `最后更新: ${timeStr}`;
+        }
+
+        async function refresh() {
+            await fetchSystemStats();
+            await fetchProcesses();
+            await fetchAnalysis();
+            updateLastUpdate();
+        }
+
+        document.addEventListener('DOMContentLoaded', () => {
+            const canvas = document.getElementById('performance-chart');
+            const rect = canvas.parentElement.getBoundingClientRect();
+            canvas.width = rect.width;
+            canvas.height = rect.height;
+            
+            refresh();
+            setInterval(refresh, 3000);
+            
+            window.addEventListener('resize', () => {
+                const rect = canvas.parentElement.getBoundingClientRect();
+                canvas.width = rect.width;
+                canvas.height = rect.height;
+                drawChart();
+            });
+        });
+    </script>
+</body>
+</html>
