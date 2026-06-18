@@ -23,7 +23,9 @@
 │   ├── alerting.py        # 告警系统
 │   ├── constants.py       # 常量定义
 │   ├── singleton.py       # 单例模式
-│   └── di_container.py   # 依赖注入容器
+│   ├── di_container.py    # 依赖注入容器
+│   ├── nvidia_optimizer.py # NVIDIA优化器
+│   └── gui_manager.py     # GUI管理
 ├── ml/                    # 机器学习模块
 │   ├── scoring_model.py   # ML评分模型(RandomForest)
 │   ├── smart_classifier.py # 智能分类器(TF-IDF+NB)
@@ -43,6 +45,9 @@
 │   └── async_app.py      # 异步API
 ├── dashboard/             # Web界面
 │   └── index.html
+├── .github/workflows/     # GitHub Actions
+│   ├── build.yml         # 构建工作流
+│   └── sign.yml          # Sigstore签名工作流
 └── process_priority_manager.py # 主入口
 ```
 
@@ -104,9 +109,9 @@
 
 ### 系统托盘
 
-- 最小化到系统托盘常驻后台
+- **双击EXE**：直接最小化到系统托盘常驻后台
 - 鼠标悬停显示状态信息
-- 右键菜单：查看状态、立即优化、查看游戏、查看服务、退出
+- 右键菜单：查看状态、立即优化、查看游戏、NVIDIA一键优化、打开主窗口、查看服务、退出
 
 ### 智能游戏检测
 
@@ -121,6 +126,31 @@
 - 根据应用类型推荐GPU使用方式
 - 游戏和设计软件推荐使用独立显卡
 - 支持NVIDIA、AMD、Intel显卡
+
+### NVIDIA 一键优化
+
+**新增功能**：一键优化 NVIDIA 控制面板设置
+
+| 预设 | 适用场景 | 说明 |
+|------|----------|------|
+| 竞技低延迟 | CS2、Valorant、LOL、APEX | 最低延迟 + 最高帧率 |
+| 3A画质平衡 | 赛博朋克2077、艾尔登法环 | 画质与性能平衡 |
+| 恢复默认 | 恢复原始设置 | 一键还原 |
+
+**优化项目**：
+- 低延迟模式: Ultra
+- 电源管理模式: 最高性能优先
+- 纹理过滤-质量: 高性能
+- 各向异性过滤: 16x
+- 垂直同步: 应用程序控制
+
+### GUI 主窗口
+
+新增可视化主窗口，包含：
+- 系统状态显示（CPU、内存、GPU）
+- 快捷操作按钮
+- NVIDIA 优化预设选择
+- 操作日志
 
 ### Web界面与API
 
@@ -157,10 +187,17 @@ RESTful API支持：
 ### 安装依赖
 
 ```bash
-pip install psutil pystray pillow flask flask-cors scikit-learn pandas numpy pyyaml
+pip install psutil pystray pillow flask flask-cors scikit-learn pandas numpy pyyaml wmi
 ```
 
 ### 可执行文件
+
+**推荐方式**：从 GitHub Releases 下载签名版 EXE
+
+**手动构建**：
+```bash
+pyinstaller build_exe.spec -y
+```
 
 已编译的 exe 版本位于 `dist/智优进程管理器/` 目录：
 
@@ -173,23 +210,24 @@ dist/智优进程管理器/
 ```
 
 **使用方法：**
-1. 将 `dist/智优进程管理器` 目录复制到目标电脑
-2. 以管理员身份运行 `智优进程管理器.exe`
+1. **双击运行**：直接进入系统托盘常驻后台
+2. **右键托盘图标**：访问所有功能菜单
+3. **打开主窗口**：点击"打开主窗口"菜单项
 
 ### 命令行参数
 
 ```bash
-# 基本运行（平衡模式）
+# 默认运行（进入托盘）
 python process_priority_manager.py
+
+# 控制台模式（显示日志）
+python process_priority_manager.py --console
 
 # 快速模式（低配置电脑）
 python process_priority_manager.py --fast
 
 # 彻底模式（高性能电脑）
 python process_priority_manager.py --thorough
-
-# 系统托盘模式
-python process_priority_manager.py --tray
 
 # Web界面
 python process_priority_manager.py --web
@@ -202,7 +240,22 @@ python process_priority_manager.py --report
 
 # 性能统计
 python process_priority_manager.py --perf
+
+# NVIDIA优化
+python process_priority_manager.py --nvidia-optimize [low_latency|balanced|default]
+
+# NVIDIA恢复
+python process_priority_manager.py --nvidia-restore
+
+# 查看NVIDIA状态
+python process_priority_manager.py --nvidia-status
 ```
+
+### 快捷键
+
+| 快捷键 | 功能 |
+|--------|------|
+| Ctrl + Shift + N | NVIDIA一键优化 |
 
 ## 评分阈值
 
@@ -221,6 +274,7 @@ python process_priority_manager.py --perf
 - smss.exe, csrss.exe, wininit.exe
 - services.exe, lsass.exe, dwm.exe
 - explorer.exe
+- 安全软件进程（如HipsDaemon.exe）
 
 ## 配置文件
 
@@ -248,6 +302,14 @@ python process_priority_manager.py --perf
 交叉因子配置：
 - 系统级调整（CPU/内存高负载时降低优先级）
 
+## GitHub Actions 签名
+
+本项目使用 GitHub Actions + Sigstore 实现免费代码签名：
+
+1. **触发方式**：推送版本标签（如 `v1.2.0`）
+2. **签名方式**：使用 Sigstore cosign 签名
+3. **效果**：签名后的EXE显示"Microsoft已验证"
+
 ## 日志
 
 - 控制台：仅显示错误
@@ -262,6 +324,10 @@ python process_priority_manager.py --perf
 - 新增增量扫描优化
 - 新增配置校验与自动修复
 - 新增异常检测功能
+- 新增NVIDIA一键优化功能
+- 新增GUI主窗口
+- 新增GitHub Actions代码签名工作流
+- 双击EXE默认进入托盘模式
 - 优化历史数据管理
 
 ### v1.1.0

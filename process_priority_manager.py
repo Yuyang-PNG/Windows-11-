@@ -1575,6 +1575,17 @@ def get_all_windows_services(keyword=None):
     services = []
     keyword_lower = keyword.lower() if keyword else None
     
+    # 预获取所有进程信息（只执行一次，避免重复遍历）
+    process_name_to_pid = {}
+    try:
+        for proc in psutil.process_iter(['pid', 'name']):
+            try:
+                process_name_to_pid[proc.name().lower()] = proc.pid
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+    except Exception:
+        pass
+    
     # 使用pywin32获取服务信息
     try:
         import win32service
@@ -1643,24 +1654,21 @@ def get_all_windows_services(keyword=None):
                                 status_info = win32service.QueryServiceStatusEx(service_handle)
                                 service_pid = status_info.get('ProcessId', None)
                             except Exception:
-                                # 备用方法：通过进程名查找
+                                # 备用方法：通过预获取的进程映射查找
                                 pass
                     finally:
                         win32service.CloseServiceHandle(service_handle)
                 except Exception:
                     pass
                 
-                # 如果没有获取到PID，尝试通过进程名查找
-                if is_running and service_pid is None:
+                # 如果没有获取到PID，尝试通过进程名查找（使用预获取的映射）
+                if is_running and service_pid is None and process_name_to_pid:
                     try:
                         service_exe_pattern = service_name.lower()
-                        for proc in psutil.process_iter(['pid', 'name']):
-                            try:
-                                if service_exe_pattern in proc.name().lower():
-                                    service_pid = proc.pid
-                                    break
-                            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                                pass
+                        for proc_name, pid in process_name_to_pid.items():
+                            if service_exe_pattern in proc_name:
+                                service_pid = pid
+                                break
                     except Exception:
                         pass
                 
