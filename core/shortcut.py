@@ -1,6 +1,9 @@
 import threading
 import time
+import logging
 from typing import Callable, Dict, Optional, List
+
+logger = logging.getLogger('process_priority_manager')
 
 class GlobalShortcutManager:
     """全局快捷键管理器"""
@@ -22,18 +25,26 @@ class GlobalShortcutManager:
         self._thread: Optional[threading.Thread] = None
         self._running = False
         self._keyboard = None
+        self._available = False
         
         # 尝试导入keyboard库
         try:
             import keyboard
             self._keyboard = keyboard
+            self._available = True
+            logger.info("keyboard库加载成功，快捷键功能已启用")
         except ImportError:
-            print("keyboard库不可用，快捷键功能禁用")
+            logger.info("keyboard库不可用，快捷键功能已禁用（可选依赖）")
+    
+    @property
+    def available(self) -> bool:
+        """检查keyboard库是否可用"""
+        return self._available
     
     def register(self, hotkey: str, callback: Callable, description: str = "") -> bool:
         """注册快捷键"""
         if not self._keyboard:
-            print("keyboard库未安装，快捷键功能禁用")
+            logger.debug(f"无法注册快捷键 {hotkey}: keyboard库不可用")
             return False
         
         try:
@@ -50,9 +61,10 @@ class GlobalShortcutManager:
             }
             self._callbacks[hotkey] = callback
             
+            logger.info(f"快捷键已注册: {hotkey} - {description}")
             return True
         except Exception as e:
-            print(f"注册快捷键失败 {hotkey}: {e}")
+            logger.error(f"注册快捷键失败 {hotkey}: {e}")
             return False
     
     def _make_callback_wrapper(self, hotkey: str):
@@ -63,7 +75,7 @@ class GlobalShortcutManager:
                     callback = self._callbacks[hotkey]
                     callback()
                 except Exception as e:
-                    print(f"快捷键回调执行失败 {hotkey}: {e}")
+                    logger.error(f"快捷键回调执行失败 {hotkey}: {e}")
         return wrapper
     
     def unregister(self, hotkey: str) -> bool:
@@ -79,7 +91,7 @@ class GlobalShortcutManager:
                 del self._callbacks[hotkey]
             return True
         except Exception as e:
-            print(f"注销快捷键失败 {hotkey}: {e}")
+            logger.error(f"注销快捷键失败 {hotkey}: {e}")
             return False
     
     def unregister_all(self):

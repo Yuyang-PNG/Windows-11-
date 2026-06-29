@@ -1,5 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
 # PyInstaller 打包配置文件 - 智优进程管理器 v1.3.0 单文件版
+# 使用方法: pyinstaller build_single.spec
 
 import os
 import sys
@@ -14,7 +15,7 @@ a = Analysis(
     pathex=[project_root],
     binaries=[],
     datas=[
-        # 配置文件 - 只包含实际存在的yaml文件
+        # 配置文件
         ('config/app_categories.yaml', 'config'),
         ('config/scoring_rules.yaml', 'config'),
         ('config/cross_factors.yaml', 'config'),
@@ -28,14 +29,12 @@ a = Analysis(
         ('ml/models/scoring_model.pkl', 'ml/models'),
     ],
     hiddenimports=[
-        # 核心依赖
         'psutil',
         'yaml',
         'json',
         'threading',
         'queue',
         'concurrent.futures',
-        # Windows API
         'win32gui',
         'win32process',
         'win32api',
@@ -44,7 +43,6 @@ a = Analysis(
         'win32serviceutil',
         'winreg',
         'wmi',
-        # 可选依赖
         'pystray',
         'PIL',
         'PIL.Image',
@@ -53,7 +51,6 @@ a = Analysis(
         'uvicorn',
         'pydantic',
         'flask',
-        # ML依赖
         'sklearn',
         'sklearn.ensemble',
         'sklearn.preprocessing',
@@ -61,7 +58,6 @@ a = Analysis(
         'sklearn.metrics',
         'sklearn.impute',
         'numpy',
-        # 项目模块
         'core.constants',
         'core.classifier',
         'core.scorer',
@@ -82,7 +78,6 @@ a = Analysis(
         'api.async_app',
         'core.nvidia_optimizer',
         'core.gui_manager',
-        # tkinter 相关
         'tkinter',
         'tkinter.ttk',
         'tkinter.messagebox',
@@ -91,7 +86,6 @@ a = Analysis(
     hooksconfig={},
     runtime_hooks=[],
     excludes=[
-        # 排除不需要的模块
         'matplotlib',
         'pandas',
         'scipy',
@@ -109,57 +103,22 @@ a = Analysis(
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
-# 单文件exe打包
+# 单文件exe - 所有依赖都打包进一个exe文件
 exe = EXE(
     pyz,
     a.scripts,
-    [],
-    exclude_binaries=True,
+    a.binaries,
+    a.zipfiles,
+    a.datas,
     name='智优进程管理器',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,
-    console=False,  # 无控制台模式
+    console=False,  # 无控制台，不显示黑色窗口
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    # 版本信息
-    version='version_info.txt',
 )
-
-# 使用 onefile 打包成单个exe文件
-coll = COLLECT(
-    exe,
-    a.binaries,
-    a.zipfiles,
-    a.datas,
-    strip=False,
-    upx=True,
-    upx_exclude=[],
-    name='智优进程管理器',
-)
-
-# 如果需要单文件输出，取消下面的注释并注释上面的 COLLECT 部分
-# from PyInstaller.building.build_main import EXE as PyInstallerEXE
-# exe = PyInstallerEXE(
-#     pyz,
-#     a.scripts,
-#     a.binaries,
-#     a.zipfiles,
-#     a.datas,
-#     name='智优进程管理器',
-#     debug=False,
-#     bootloader_ignore_signals=False,
-#     strip=False,
-#     upx=True,
-#     console=False,
-#     disable_windowed_traceback=False,
-#     argv_emulation=False,
-#     target_arch=None,
-#     codesign_identity=None,
-#     entitlements_file=None,
-#     version='version_info.txt',
-# )

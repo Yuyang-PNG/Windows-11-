@@ -893,148 +893,32 @@ def save_config(config):
         print(f"配置保存失败: {e}")
         return False
 
-def detect_gpu_brand(name):
-    name_upper = name.upper()
-    if 'NVIDIA' in name_upper or 'GEFORCE' in name_upper:
-        return {'brand': 'NVIDIA', 'brand_name': '英伟达', 'color': '绿色'}
-    elif 'AMD' in name_upper or 'RADEON' in name_upper:
-        return {'brand': 'AMD', 'brand_name': '超威半导体', 'color': '红色'}
-    elif 'INTEL ARC' in name_upper:
-        return {'brand': 'Intel', 'brand_name': '英特尔 Arc', 'color': '蓝色', 'is_discrete': True}
-    elif 'INTEL' in name_upper or 'UHD' in name_upper or 'HD GRAPHICS' in name_upper:
-        return {'brand': 'Intel', 'brand_name': '英特尔', 'color': '蓝色', 'is_discrete': False}
-    elif 'ATI' in name_upper:
-        return {'brand': 'ATI', 'brand_name': 'ATI', 'color': '红色'}
-    elif 'SAPPHIRE' in name_upper:
-        return {'brand': 'Sapphire', 'brand_name': '蓝宝石', 'color': '蓝色'}
-    elif 'EVGA' in name_upper:
-        return {'brand': 'EVGA', 'brand_name': 'EVGA', 'color': '绿色'}
-    elif 'MSI' in name_upper:
-        return {'brand': 'MSI', 'brand_name': '微星', 'color': '红色'}
-    else:
-        return {'brand': 'Unknown', 'brand_name': '未知', 'color': '灰色', 'is_discrete': False}
-
-def _detect_nvidia_gpus(existing_names):
-    gpus = []
-    try:
-        import subprocess
-        result = subprocess.run(
-            ['nvidia-smi', '--query-gpu=name,memory.total,memory.used,utilization.gpu', 
-             '--format=csv,noheader,nounits'],
-            capture_output=True, text=True, timeout=5
-        )
-        if result.returncode == 0:
-            for line in result.stdout.strip().split('\n'):
-                parts = line.split(',')
-                if len(parts) >= 4:
-                    gpu_name = parts[0].strip()
-                    if gpu_name not in existing_names:
-                        gpus.append({
-                            'name': gpu_name,
-                            'memory_total': int(parts[1].strip()),
-                            'memory_used': int(parts[2].strip()),
-                            'utilization': int(parts[3].strip()),
-                            'type': 'discrete',
-                            **detect_gpu_brand(gpu_name)
-                        })
-        logger.debug(f"NVIDIA检测完成，找到 {len(gpus)} 个GPU")
-    except Exception as e:
-        logger.debug(f"NVIDIA检测失败: {e}")
-    return gpus
-
-def _detect_amd_gpus(existing_names):
-    gpus = []
-    try:
-        import subprocess
-        result = subprocess.run(
-            ['powershell', '-Command', 
-             'Get-CimInstance -ClassName Win32_VideoController | Select-Object Name,AdapterRAM | ConvertTo-Json'],
-            capture_output=True, text=True, timeout=10
-        )
-        if result.returncode == 0:
-            import json
-            try:
-                data = json.loads(result.stdout)
-                if isinstance(data, dict):
-                    data = [data]
-                for adapter in data:
-                    gpu_name = adapter.get('Name', 'Unknown GPU')
-                    if 'AMD' in gpu_name.upper() or 'RADEON' in gpu_name.upper():
-                        if gpu_name not in existing_names:
-                            vram = int(adapter.get('AdapterRAM', 0)) // (1024 ** 2) if adapter.get('AdapterRAM') else 0
-                            gpus.append({
-                                'name': gpu_name,
-                                'memory_total': vram,
-                                'memory_used': 0,
-                                'utilization': 0,
-                                'type': 'discrete',
-                                **detect_gpu_brand(gpu_name)
-                            })
-            except json.JSONDecodeError:
-                pass
-        logger.debug(f"AMD检测完成，找到 {len(gpus)} 个GPU")
-    except Exception as e:
-        logger.debug(f"AMD检测失败: {e}")
-    return gpus
-
-def _detect_wmi_gpus(existing_names):
-    gpus = []
-    try:
-        import wmi
-        c = wmi.WMI()
-        for adapter in c.Win32_VideoController():
-            gpu_name = adapter.Name
-            if gpu_name not in existing_names:
-                brand_info = detect_gpu_brand(gpu_name)
-                vram = int(adapter.AdapterRAM) // (1024 ** 2) if adapter.AdapterRAM else 0
-                
-                if brand_info.get('is_discrete') or 'Intel Arc' in gpu_name:
-                    gpu_type = 'discrete'
-                elif 'Intel' in gpu_name or 'UHD' in gpu_name or 'HD Graphics' in gpu_name:
-                    gpu_type = 'integrated'
-                else:
-                    gpu_type = 'discrete' if vram > 1024 else 'integrated'
-                
-                gpus.append({
-                    'name': gpu_name,
-                    'memory_total': vram,
-                    'memory_used': 0,
-                    'utilization': 0,
-                    'type': gpu_type,
-                    **brand_info
-                })
-        logger.debug(f"WMI检测完成，找到 {len(gpus)} 个GPU")
-    except ImportError:
-        logger.debug(f"WMI检测跳过: wmi模块未安装")
-    except Exception as e:
-        logger.debug(f"WMI检测失败: {e}")
-    return gpus
-
 def get_gpu_info(force_refresh=False):
-    if not force_refresh:
-        cached = GPU_CACHE.get('gpu_info')
-        if cached is not None:
-            logger.debug("使用缓存的GPU信息")
-            return cached
+    """
+    获取GPU信息（使用GPUManager服务）
     
-    gpus = []
-    detected_names = set()
-    
-    detectors = [_detect_nvidia_gpus, _detect_amd_gpus, _detect_wmi_gpus]
-    
-    for detector in detectors:
-        new_gpus = detector(detected_names)
-        for gpu in new_gpus:
-            if gpu['name'] not in detected_names:
-                detected_names.add(gpu['name'])
-                gpus.append(gpu)
-    
-    for i, gpu in enumerate(gpus):
-        gpu['index'] = i
-    
-    GPU_CACHE.set('gpu_info', gpus)
-    logger.info(f"GPU检测完成，共找到 {len(gpus)} 个GPU")
-    return gpus
+    Args:
+        force_refresh: 是否强制刷新缓存
+        
+    Returns:
+        List[Dict]: GPU信息列表
+    """
+    try:
+        from core.di_container import ServiceProvider
+        from core.gpu_manager import GPUManager
+        
+        gpu_manager = ServiceProvider.try_get(GPUManager)
+        if gpu_manager is None:
+            gpu_manager = GPUManager()
+            logger.warning("GPUManager未在DI容器中注册，使用临时实例")
+        
+        gpus = gpu_manager.get_gpu_info(force_refresh=force_refresh)
+        logger.info(f"GPU检测完成，共找到 {len(gpus)} 个GPU")
+        return gpus
+        
+    except Exception as e:
+        logger.error(f"GPU检测失败: {e}")
+        return []
 
 def get_gpu_settings_from_registry():
     settings = {}
@@ -1699,7 +1583,8 @@ def get_all_windows_services(keyword=None):
                 ['powershell', '-Command', 'Get-Service | Select-Object Name, DisplayName, Status, StartType | ConvertTo-Json'],
                 capture_output=True,
                 text=True,
-                timeout=30
+                timeout=30,
+                creationflags=subprocess.CREATE_NO_WINDOW
             )
             
             if result.returncode == 0 and result.stdout:
@@ -2163,7 +2048,8 @@ def get_pagefile_info():
                 Drive = if ($pagefile) { $pagefile.Name } else { "Unknown" }
             } | ConvertTo-Json
             '''.strip()],
-            capture_output=True, text=True, timeout=30
+            capture_output=True, text=True, timeout=30,
+            creationflags=subprocess.CREATE_NO_WINDOW
         )
         if result.returncode == 0:
             import json
@@ -2299,7 +2185,8 @@ def set_pagefile(min_gb, max_gb):
         
         result = subprocess.run(
             ['powershell', '-Command', command],
-            capture_output=True, text=True, timeout=60
+            capture_output=True, text=True, timeout=60,
+            creationflags=subprocess.CREATE_NO_WINDOW
         )
         
         print(result.stdout)
@@ -2324,7 +2211,8 @@ def set_pagefile_auto():
         
         result = subprocess.run(
             ['powershell', '-Command', command],
-            capture_output=True, text=True, timeout=60
+            capture_output=True, text=True, timeout=60,
+            creationflags=subprocess.CREATE_NO_WINDOW
         )
         
         print(result.stdout)
@@ -2339,7 +2227,8 @@ def get_installed_apps():
     try:
         result = subprocess.run(
             ['powershell', '-Command', 'Get-AppxPackage | Select-Object Name, PackageFullName, InstallLocation | ConvertTo-Json'],
-            capture_output=True, text=True, timeout=30
+            capture_output=True, text=True, timeout=30,
+            creationflags=subprocess.CREATE_NO_WINDOW
         )
         if result.returncode == 0:
             import json
@@ -2377,7 +2266,8 @@ def remove_app(package_full_name):
         '''
         result = subprocess.run(
             ['powershell', '-Command', command],
-            capture_output=True, text=True, timeout=30
+            capture_output=True, text=True, timeout=30,
+            creationflags=subprocess.CREATE_NO_WINDOW
         )
         return result.returncode == 0
     except Exception as e:
@@ -2410,7 +2300,8 @@ def remove_app_for_all_users(package_name):
         '''
         result = subprocess.run(
             ['powershell', '-Command', command],
-            capture_output=True, text=True, timeout=30
+            capture_output=True, text=True, timeout=30,
+            creationflags=subprocess.CREATE_NO_WINDOW
         )
         return result.returncode == 0
     except Exception as e:
@@ -3341,6 +3232,136 @@ def create_tray_icon():
         draw.ellipse([10, 10, 54, 54], fill=(120, 180, 240))
         return image
 
+def run_cleanup():
+    """执行缓存清理 - 在单独线程中执行"""
+    def _do_cleanup():
+        try:
+            import shutil
+            import tempfile
+            
+            cleaned_total = 0
+            cleaned_count = 0
+            error_count = 0
+            
+            # 清理目标列表
+            temp_locations = []
+            
+            # Windows 用户临时文件夹
+            user_temp = os.path.join(os.environ.get('TEMP', ''), '')
+            if user_temp and os.path.exists(user_temp):
+                temp_locations.append(('用户临时文件夹', user_temp))
+            
+            # Windows 系统临时文件夹
+            system_temp = os.path.join(os.environ.get('WINDIR', 'C:\\Windows'), 'Temp')
+            if os.path.exists(system_temp):
+                temp_locations.append(('系统临时文件夹', system_temp))
+            
+            # IE/Edge 临时文件
+            ie_cache = os.path.join(os.environ.get('LOCALAPPDATA', ''), 'Microsoft', 'Windows', 'INetCache')
+            if os.path.exists(ie_cache):
+                temp_locations.append(('IE/Edge 缓存', ie_cache))
+            
+            # Chrome 临时文件 (如果存在)
+            chrome_cache = os.path.join(os.environ.get('LOCALAPPDATA', ''), 'Google', 'Chrome', 'User Data', 'Default', 'Cache')
+            if os.path.exists(chrome_cache):
+                temp_locations.append(('Chrome 缓存', chrome_cache))
+            
+            # pip 缓存
+            pip_cache = os.path.join(os.environ.get('LOCALAPPDATA', ''), 'pip', 'cache')
+            if os.path.exists(pip_cache):
+                temp_locations.append(('pip 缓存', pip_cache))
+            
+            result_text = "缓存清理完成\n\n"
+            safe_print("正在清理系统缓存...")
+            
+            for name, path in temp_locations:
+                try:
+                    if not os.path.exists(path):
+                        continue
+                        
+                    size_before = 0
+                    count_before = 0
+                    for root, dirs, files in os.walk(path):
+                        for f in files:
+                            fp = os.path.join(root, f)
+                            try:
+                                size_before += os.path.getsize(fp)
+                                count_before += 1
+                            except:
+                                pass
+                    
+                    if count_before == 0:
+                        continue
+                    
+                    # 清理
+                    deleted_size = 0
+                    deleted_count = 0
+                    for root, dirs, files in os.walk(path):
+                        for f in files:
+                            fp = os.path.join(root, f)
+                            try:
+                                os.remove(fp)
+                                try:
+                                    deleted_size += os.path.getsize(fp)
+                                except:
+                                    pass
+                                deleted_count += 1
+                            except:
+                                pass
+                    
+                    cleaned_total += deleted_size
+                    cleaned_count += deleted_count
+                    
+                    if deleted_count > 0:
+                        size_str = format_size(deleted_size)
+                        logger.info(f"清理 {name}: {deleted_count} 个文件, {size_str}")
+                        
+                except Exception as e:
+                    error_count += 1
+                    logger.warning(f"清理 {name} 失败: {e}")
+            
+            # 清理日志文件（保留最近的）
+            try:
+                log_dir = os.path.dirname(LOG_FILE) if LOG_FILE else 'logs'
+                if os.path.exists(log_dir):
+                    log_files = [f for f in os.listdir(log_dir) if f.endswith('.log')]
+                    log_files.sort(key=lambda x: os.path.getmtime(os.path.join(log_dir, x)), reverse=True)
+                    for old_log in log_files[5:]:  # 保留最近5个
+                        try:
+                            fp = os.path.join(log_dir, old_log)
+                            size = os.path.getsize(fp)
+                            os.remove(fp)
+                            cleaned_total += size
+                            cleaned_count += 1
+                            logger.debug(f"删除旧日志: {old_log}")
+                        except:
+                            pass
+            except:
+                pass
+            
+            result_text += f"清理文件数: {cleaned_count} 个\n"
+            result_text += f"释放空间: {format_size(cleaned_total)}\n"
+            if error_count > 0:
+                result_text += f"错误: {error_count} 处"
+            
+            safe_print(f"缓存清理完成: {cleaned_count} 个文件, {format_size(cleaned_total)}")
+            show_quick_message("清理完成", result_text, "info")
+            
+        except Exception as e:
+            logger.error(f"清理缓存失败: {e}")
+            show_quick_message("清理失败", f"清理缓存失败: {e}", "error")
+    
+    thread = threading.Thread(target=_do_cleanup, daemon=True)
+    thread.start()
+
+def format_size(size_bytes):
+    """格式化文件大小"""
+    for unit in ['B', 'KB', 'MB', 'GB']:
+        if size_bytes < 1024:
+            return f"{size_bytes:.2f} {unit}"
+        size_bytes /= 1024
+    return f"{size_bytes:.2f} TB"
+
 def on_tray_click(icon, item):
     """托盘菜单点击处理"""
     item_str = str(item)
@@ -3355,6 +3376,8 @@ def on_tray_click(icon, item):
             run_optimization()
         elif item_str == "NVIDIA一键优化":
             run_nvidia_optimization(preset_name="low_latency")
+        elif item_str == "清理缓存":
+            run_cleanup()
         elif item_str == "打开主窗口":
             main_window = get_main_window()
             main_window.set_callback('view_status', show_status)
@@ -3362,6 +3385,7 @@ def on_tray_click(icon, item):
             main_window.set_callback('optimize', run_optimization)
             main_window.set_callback('nvidia_optimize', run_nvidia_optimization)
             main_window.set_callback('view_services', show_services)
+            main_window.set_callback('cleanup', run_cleanup)
             main_window.show()
         elif item_str == "查看服务":
             show_services()
@@ -3778,6 +3802,8 @@ def run_tray_service():
             pystray.MenuItem("查看游戏", on_tray_click),
             pystray.MenuItem("立即优化", on_tray_click),
             pystray.MenuItem("NVIDIA一键优化", on_tray_click),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("清理缓存", on_tray_click),
             pystray.MenuItem("打开主窗口", on_tray_click),
             pystray.MenuItem("查看服务", on_tray_click),
             pystray.Menu.SEPARATOR,
