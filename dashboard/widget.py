@@ -91,7 +91,7 @@ WIDGET_HTML = '''
         <span style="font-size: 20px;">🎮</span>
         <div>
             <h1>智优进程管理器</h1>
-            <div class="version">v1.2.0</div>
+            <div class="version">v1.2.3</div>
         </div>
     </div>
     

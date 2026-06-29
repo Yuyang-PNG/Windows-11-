@@ -3196,7 +3196,7 @@ def show_advanced_menu(config):
 # ==================== 系统托盘功能 ====================
 
 APP_DISPLAY_NAME = "智优进程管理器"
-APP_VERSION = "v1.3.1"
+APP_VERSION = "v1.2.3"
 
 _update_manager = None
 
@@ -3641,7 +3641,7 @@ def show_status():
             system_metrics = get_system_metrics()
 
             # 构建状态文本
-            status_text = "智优进程管理器 v1.2.0 - 系统状态\n\n"
+            status_text = "智优进程管理器 v1.2.3 - 系统状态\n\n"
             status_text += f"CPU: {system_metrics['cpu_percent']}% ({system_metrics['cpu_count']}核)\n"
             status_text += f"内存: {system_metrics['memory_percent']}%\n"
             status_text += f"可用内存: {system_metrics['memory_available']:.1f} GB\n"
@@ -3860,7 +3860,7 @@ def run_tray_service():
         # 设置日志 - 用户模式
         setup_logging(verbose=False)
 
-        safe_print("智优进程管理器 v1.2.0 - 启动中...")
+        safe_print("智优进程管理器 v1.2.3 - 启动中...")
 
         # 初始化应用
         APP.initialize()
@@ -3906,7 +3906,7 @@ def run_tray_service():
         threading.Thread(target=_background_check_updates, daemon=True).start()
         safe_print("后台更新检查已启动")
 
-        safe_print("\n智优进程管理器 v1.2.0 已启动")
+        safe_print("\n智优进程管理器 v1.2.3 已启动")
         safe_print("智能游戏检测已启用")
         safe_print("全局快捷键已启用")
         safe_print("\n右键点击托盘图标查看菜单")
