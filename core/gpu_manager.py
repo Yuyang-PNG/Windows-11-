@@ -1,10 +1,10 @@
-import subprocess
 import threading
 import time
 from typing import Dict, List, Optional, Any
 from core.di_container import ServiceProvider
 from core.logger import get_logger
 from core.cache import TTLCache
+from core.subprocess_utils import run_nvidia_smi, run_powershell, run_typeperf
 
 
 class GPUInfo:
@@ -41,15 +41,13 @@ class NvidiaGPUDetector(GPUDetector):
     def detect(self) -> List[Dict[str, Any]]:
         gpus: List[Dict[str, Any]] = []
         try:
-            result = subprocess.run(
-                ['nvidia-smi', '--query-gpu=name,memory.total,memory.used,utilization.gpu',
-                 '--format=csv,noheader,nounits'],
-                capture_output=True,
-                text=True,
+            success, output = run_nvidia_smi(
+                'name,memory.total,memory.used,utilization.gpu',
+                'csv,noheader,nounits',
                 timeout=self._timeout
             )
-            if result.returncode == 0:
-                for line in result.stdout.strip().split('\n'):
+            if success and output:
+                for line in output.strip().split('\n'):
                     parts = line.split(',')
                     if len(parts) >= 4:
                         gpus.append({
@@ -60,8 +58,6 @@ class NvidiaGPUDetector(GPUDetector):
                             'type': 'discrete',
                             'brand': 'NVIDIA'
                         })
-        except subprocess.TimeoutExpired:
-            pass
         except Exception:
             pass
         return gpus
@@ -74,17 +70,14 @@ class AMDGPUDetector(GPUDetector):
     def detect(self) -> List[Dict[str, Any]]:
         gpus: List[Dict[str, Any]] = []
         try:
-            result = subprocess.run(
-                ['powershell', '-Command',
-                 'Get-CimInstance -ClassName Win32_VideoController | Select-Object Name,AdapterRAM | ConvertTo-Json'],
-                capture_output=True,
-                text=True,
+            success, output = run_powershell(
+                'Get-CimInstance -ClassName Win32_VideoController | Select-Object Name,AdapterRAM | ConvertTo-Json',
                 timeout=self._timeout
             )
-            if result.returncode == 0:
+            if success and output:
                 import json
                 try:
-                    data = json.loads(result.stdout)
+                    data = json.loads(output)
                     if isinstance(data, dict):
                         data = [data]
                     for adapter in data:
@@ -101,8 +94,6 @@ class AMDGPUDetector(GPUDetector):
                             })
                 except json.JSONDecodeError:
                     pass
-        except subprocess.TimeoutExpired:
-            pass
         except Exception:
             pass
         return gpus
@@ -115,38 +106,46 @@ class WMIGPUDetector(GPUDetector):
     def detect(self) -> List[Dict[str, Any]]:
         gpus: List[Dict[str, Any]] = []
         try:
-            import wmi
-            c = wmi.WMI()
-            for adapter in c.Win32_VideoController():
-                gpu_name = adapter.Name
-                vram = int(adapter.AdapterRAM) // (1024 ** 2) if adapter.AdapterRAM else 0
+            success, output = run_powershell(
+                'Get-CimInstance -ClassName Win32_VideoController | Select-Object Name,AdapterRAM | ConvertTo-Json',
+                timeout=self._timeout
+            )
+            if success and output:
+                import json
+                try:
+                    data = json.loads(output)
+                    if isinstance(data, dict):
+                        data = [data]
+                    for adapter in data:
+                        gpu_name = adapter.get('Name', 'Unknown GPU')
+                        vram = int(adapter.get('AdapterRAM', 0)) // (1024 ** 2) if adapter.get('AdapterRAM') else 0
 
-                if 'NVIDIA' in gpu_name.upper() or 'GEFORCE' in gpu_name.upper():
-                    brand = 'NVIDIA'
-                    gpu_type = 'discrete'
-                elif 'AMD' in gpu_name.upper() or 'RADEON' in gpu_name.upper():
-                    brand = 'AMD'
-                    gpu_type = 'discrete'
-                elif 'Intel Arc' in gpu_name:
-                    brand = 'Intel Arc'
-                    gpu_type = 'discrete'
-                elif 'Intel' in gpu_name or 'UHD' in gpu_name or 'HD Graphics' in gpu_name:
-                    brand = 'Intel'
-                    gpu_type = 'integrated'
-                else:
-                    brand = 'Unknown'
-                    gpu_type = 'discrete' if vram > 1024 else 'integrated'
+                        if 'NVIDIA' in gpu_name.upper() or 'GEFORCE' in gpu_name.upper():
+                            brand = 'NVIDIA'
+                            gpu_type = 'discrete'
+                        elif 'AMD' in gpu_name.upper() or 'RADEON' in gpu_name.upper():
+                            brand = 'AMD'
+                            gpu_type = 'discrete'
+                        elif 'Intel Arc' in gpu_name:
+                            brand = 'Intel Arc'
+                            gpu_type = 'discrete'
+                        elif 'Intel' in gpu_name or 'UHD' in gpu_name or 'HD Graphics' in gpu_name:
+                            brand = 'Intel'
+                            gpu_type = 'integrated'
+                        else:
+                            brand = 'Unknown'
+                            gpu_type = 'discrete' if vram > 1024 else 'integrated'
 
-                gpus.append({
-                    'name': gpu_name,
-                    'memory_total': vram,
-                    'memory_used': 0,
-                    'utilization': 0,
-                    'type': gpu_type,
-                    'brand': brand
-                })
-        except ImportError:
-            pass
+                        gpus.append({
+                            'name': gpu_name,
+                            'memory_total': vram,
+                            'memory_used': 0,
+                            'utilization': 0,
+                            'type': gpu_type,
+                            'brand': brand
+                        })
+                except json.JSONDecodeError:
+                    pass
         except Exception:
             pass
         return gpus

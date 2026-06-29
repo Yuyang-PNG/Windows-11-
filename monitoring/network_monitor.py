@@ -1,7 +1,8 @@
 import os
 import time
-import subprocess
 import psutil
+from core.subprocess_utils import run_typeperf
+
 
 class NetworkMonitor:
     def __init__(self):
@@ -9,7 +10,6 @@ class NetworkMonitor:
         self.last_check_time = {}
     
     def get_network_io_for_process(self, process):
-        """获取进程的网络IO统计"""
         try:
             pid = process.pid
             process_name = process.name().lower()
@@ -49,41 +49,23 @@ class NetworkMonitor:
             return self._fallback_network_stats(pid, process_name)
     
     def _fallback_network_stats(self, pid, process_name):
-        """使用Windows性能计数器作为备选方案"""
         try:
-            result = subprocess.run(
-                ['typeperf', '-sc', '1', 
-                 f"\\Process({process_name})\\IO Read Bytes/sec",
-                 f"\\Process({process_name})\\IO Write Bytes/sec"],
-                capture_output=True,
-                text=True,
-                timeout=3
-            )
+            read_sec = run_typeperf(f"\\Process({process_name})\\IO Read Bytes/sec", samples=1, timeout=3)
+            write_sec = run_typeperf(f"\\Process({process_name})\\IO Write Bytes/sec", samples=1, timeout=3)
             
-            if result.returncode == 0:
-                lines = result.stdout.strip().split('\n')
-                if len(lines) >= 2:
-                    data_line = lines[-1]
-                    parts = data_line.split(',')
-                    if len(parts) >= 3:
-                        try:
-                            read_sec = float(parts[1].strip('"'))
-                            write_sec = float(parts[2].strip('"'))
-                            return {
-                                'read_bytes': 0,
-                                'write_bytes': 0,
-                                'read_bytes_sec': read_sec,
-                                'write_bytes_sec': write_sec
-                            }
-                        except ValueError:
-                            pass
+            if read_sec is not None or write_sec is not None:
+                return {
+                    'read_bytes': 0,
+                    'write_bytes': 0,
+                    'read_bytes_sec': read_sec or 0,
+                    'write_bytes_sec': write_sec or 0
+                }
         except Exception:
             pass
         
         return {'read_bytes': 0, 'write_bytes': 0, 'read_bytes_sec': 0, 'write_bytes_sec': 0}
     
     def get_total_network_stats(self):
-        """获取系统总网络IO统计"""
         try:
             net_io = psutil.net_io_counters()
             return {
@@ -97,11 +79,9 @@ class NetworkMonitor:
                 'dropout': net_io.dropout
             }
         except Exception as e:
-            print(f"获取网络统计失败: {e}")
             return {}
     
     def get_network_interfaces(self):
-        """获取网络接口信息"""
         interfaces = []
         try:
             for iface, addrs in psutil.net_if_addrs().items():
@@ -118,12 +98,11 @@ class NetworkMonitor:
                     })
                 interfaces.append(interface_info)
         except Exception as e:
-            print(f"获取网络接口失败: {e}")
+            pass
         
         return interfaces
     
     def get_network_connections(self, pid=None):
-        """获取网络连接信息"""
         connections = []
         try:
             for conn in psutil.net_connections(kind='inet'):
@@ -140,12 +119,11 @@ class NetworkMonitor:
                     'pid': conn.pid
                 })
         except Exception as e:
-            print(f"获取网络连接失败: {e}")
+            pass
         
         return connections
     
     def format_bytes(self, bytes_value):
-        """格式化字节数"""
         if bytes_value is None:
             return "N/A"
         
@@ -159,7 +137,6 @@ class NetworkMonitor:
             return f"{bytes_value / (1024 ** 3):.2f} GB"
     
     def get_process_network_summary(self, process):
-        """获取进程网络使用摘要"""
         io_stats = self.get_network_io_for_process(process)
         
         return {

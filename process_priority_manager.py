@@ -5098,33 +5098,39 @@ def start_api_server(port=5000):
         print(f"❌ API服务启动失败: {e}")
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1:
-        if sys.argv[1] == '--web':
-            run_web_server()
-            sys.exit(0)
-        elif sys.argv[1] == '--tray':
-            if TRAY_AVAILABLE:
-                run_tray_service()
-            else:
-                print("❌ 系统托盘功能不可用，请安装依赖: pip install pystray pillow")
-                sys.exit(1)
-            sys.exit(0)
-        elif sys.argv[1] == '--widget':
-            # 启动小组件模式
-            from api.app import ProcessPriorityAPI
-            try:
-                from dashboard.widget import widget_bp
-                api = ProcessPriorityAPI()
-                api.app.register_blueprint(widget_bp)
-                api.start()
-                print("\n🎮 小组件服务已启动")
-                print("访问地址: http://localhost:5000/widget")
-                print("按 Ctrl+C 停止服务")
-                while True:
-                    time.sleep(1)
-            except ImportError as e:
-                print(f"❌ 导入失败: {e}")
-                sys.exit(1)
-            sys.exit(0)
+    from core.thread_utils import setup_global_exception_handler, log_crash
     
-    main()
+    setup_global_exception_handler()
+    
+    try:
+        if len(sys.argv) > 1:
+            if sys.argv[1] == '--web':
+                run_web_server()
+                sys.exit(0)
+            elif sys.argv[1] == '--tray':
+                if TRAY_AVAILABLE:
+                    run_tray_service()
+                else:
+                    print("❌ 系统托盘功能不可用，请安装依赖: pip install pystray pillow")
+                    sys.exit(1)
+                sys.exit(0)
+            elif sys.argv[1] == '--widget':
+                from api.app import ProcessPriorityAPI
+                try:
+                    from dashboard.widget import widget_bp
+                    api = ProcessPriorityAPI()
+                    api.app.register_blueprint(widget_bp)
+                    api.start()
+                    print("\n🎮 小组件服务已启动")
+                    print("访问地址: http://localhost:5000/widget")
+                    print("按 Ctrl+C 停止服务")
+                    while True:
+                        time.sleep(1)
+                except ImportError as e:
+                    print(f"❌ 导入失败: {e}")
+                    sys.exit(1)
+                sys.exit(0)
+        
+        main()
+    except Exception as e:
+        log_crash(type(e), e, sys.exc_info()[2], "主入口")

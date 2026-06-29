@@ -192,27 +192,28 @@ def is_nvidia_driver_installed() -> bool:
 def is_nvidia_gpu_present() -> bool:
     """检测系统是否存在 NVIDIA GPU。"""
     try:
-        import wmi
-        c = wmi.WMI()
-        for gpu in c.Win32_VideoController():
-            name = gpu.Name or ""
-            if "NVIDIA" in name.upper() or "GEFORCE" in name.upper():
-                return True
+        from core.subprocess_utils import run_powershell, run_nvidia_smi
+        
+        success, output = run_powershell(
+            'Get-CimInstance -ClassName Win32_VideoController | Select-Object Name | ConvertTo-Json',
+            timeout=5
+        )
+        if success and output:
+            import json
+            data = json.loads(output)
+            if isinstance(data, dict):
+                data = [data]
+            for adapter in data:
+                name = adapter.get('Name', '') or ""
+                if "NVIDIA" in name.upper() or "GEFORCE" in name.upper():
+                    return True
     except Exception:
         pass
 
-    # 如果 wmi 不可用，尝试 nvidia-smi
     try:
-        import shutil
-        import subprocess
-        nvidia_smi = shutil.which("nvidia-smi")
-        if nvidia_smi:
-            result = subprocess.run(
-                [nvidia_smi, "--query-gpu=name", "--format=csv,noheader"],
-                capture_output=True, text=True, timeout=5, creationflags=subprocess.CREATE_NO_WINDOW
-            )
-            if result.returncode == 0 and result.stdout.strip():
-                return True
+        success, output = run_nvidia_smi('name', 'csv,noheader', timeout=5)
+        if success and output.strip():
+            return True
     except Exception:
         pass
 

@@ -1,7 +1,8 @@
 import os
 import time
-import subprocess
 from datetime import datetime
+from core.subprocess_utils import run_typeperf
+
 
 class PerformanceCounter:
     def __init__(self):
@@ -25,26 +26,8 @@ class PerformanceCounter:
     
     def _get_counter_value(self, counter_path):
         try:
-            result = subprocess.run(
-                ['typeperf', '-sc', '1', counter_path],
-                capture_output=True,
-                text=True,
-                timeout=5
-            )
-            
-            if result.returncode == 0:
-                lines = result.stdout.strip().split('\n')
-                if len(lines) >= 2:
-                    data_line = lines[-1]
-                    parts = data_line.split(',')
-                    if len(parts) >= 2:
-                        try:
-                            return float(parts[-1].strip('"'))
-                        except ValueError:
-                            return None
-            return None
-        except Exception as e:
-            print(f"获取性能计数器失败 {counter_path}: {e}")
+            return run_typeperf(counter_path, samples=1, timeout=5)
+        except Exception:
             return None
     
     def get_cpu_metrics(self):

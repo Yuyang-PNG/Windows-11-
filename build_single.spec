@@ -1,13 +1,11 @@
 # -*- mode: python ; coding: utf-8 -*-
-# PyInstaller 打包配置文件 - 智优进程管理器 v1.3.0 单文件版
-# 使用方法: pyinstaller build_single.spec
+# PyInstaller 打包配置文件 - 智优进程管理器 v1.2.3 单文件版
 
 import os
 import sys
 
 block_cipher = None
 
-# 获取项目根目录
 project_root = os.path.dirname(SPEC)
 
 a = Analysis(
@@ -15,13 +13,10 @@ a = Analysis(
     pathex=[project_root],
     binaries=[],
     datas=[
-        # 配置文件
         ('config/app_categories.yaml', 'config'),
         ('config/scoring_rules.yaml', 'config'),
         ('config/cross_factors.yaml', 'config'),
-        # Dashboard
         ('dashboard/index.html', 'dashboard'),
-        # ML模型文件
         ('ml/models/classifier_pipeline.pkl', 'ml/models'),
         ('ml/models/imputer.pkl', 'ml/models'),
         ('ml/models/label_encoder.pkl', 'ml/models'),
@@ -47,10 +42,6 @@ a = Analysis(
         'PIL',
         'PIL.Image',
         'PIL.ImageDraw',
-        'fastapi',
-        'uvicorn',
-        'pydantic',
-        'flask',
         'sklearn',
         'sklearn.ensemble',
         'sklearn.preprocessing',
@@ -74,10 +65,10 @@ a = Analysis(
         'monitoring.network_monitor',
         'ml.scoring_model',
         'ml.smart_classifier',
-        'api.app',
-        'api.async_app',
         'core.nvidia_optimizer',
         'core.gui_manager',
+        'core.subprocess_utils',
+        'core.thread_utils',
         'tkinter',
         'tkinter.ttk',
         'tkinter.messagebox',
@@ -94,6 +85,10 @@ a = Analysis(
         'notebook',
         'unittest',
         'pytest',
+        'fastapi',
+        'uvicorn',
+        'pydantic',
+        'flask',
     ],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
@@ -103,7 +98,6 @@ a = Analysis(
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
-# 单文件exe - 所有依赖都打包进一个exe文件
 exe = EXE(
     pyz,
     a.scripts,
@@ -115,7 +109,7 @@ exe = EXE(
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,
-    console=False,  # 无控制台，不显示黑色窗口
+    console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
