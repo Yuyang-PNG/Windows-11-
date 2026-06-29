@@ -3196,7 +3196,75 @@ def show_advanced_menu(config):
 # ==================== 系统托盘功能 ====================
 
 APP_DISPLAY_NAME = "智优进程管理器"
-APP_VERSION = "v1.3.0"
+APP_VERSION = "v1.3.1"
+
+_update_manager = None
+
+def _get_update_manager():
+    global _update_manager
+    if _update_manager is None:
+        from core.updater import UpdateManager, get_current_exe_path
+        _update_manager = UpdateManager(APP_VERSION)
+    return _update_manager
+
+def check_for_updates_action():
+    """检查更新操作"""
+    def _do_check():
+        try:
+            updater = _get_update_manager()
+            show_quick_message("检查更新", "正在检查最新版本...", "info")
+            
+            result = updater.check_for_updates()
+            
+            if result['available']:
+                import tkinter as tk
+                from tkinter import messagebox
+                
+                root = tk.Tk()
+                root.withdraw()
+                
+                msg = f"发现新版本 {result['latest_version']}\n\n当前版本: {result['current_version']}\n\n更新日志:\n{result['release_notes'][:200]}..." if result['release_notes'] else f"发现新版本 {result['latest_version']}\n\n当前版本: {result['current_version']}"
+                
+                if messagebox.askyesno("更新提示", msg + "\n\n是否立即下载并安装更新？"):
+                    show_quick_message("正在下载", "正在下载更新，请稍候...", "info")
+                    
+                    def on_download_progress():
+                        progress = updater.get_download_progress()
+                        if progress > 0 and progress < 100:
+                            show_quick_message("下载中", f"下载进度: {progress}%", "info")
+                            root.after(2000, on_download_progress)
+                    
+                    root.after(1000, on_download_progress)
+                    
+                    exe_path = getattr(sys, 'frozen', False) and sys.executable or os.path.abspath(__file__)
+                    updater.download_and_install_async(exe_path)
+                
+                root.destroy()
+            else:
+                msg = result['error'] if result['error'] else f"当前已是最新版本 ({result['current_version']})"
+                show_quick_message("检查更新", msg, "info")
+        
+        except Exception as e:
+            logger.error(f"检查更新失败: {e}")
+            show_quick_message("检查更新", f"检查更新失败: {e}", "error")
+    
+    import threading
+    threading.Thread(target=_do_check, daemon=True).start()
+
+def _background_check_updates():
+    """后台静默检查更新"""
+    try:
+        import time
+        time.sleep(10)
+        
+        updater = _get_update_manager()
+        result = updater.check_for_updates()
+        
+        if result['available']:
+            show_quick_message("更新提示", f"发现新版本 {result['latest_version']}\n右键托盘图标选择'检查更新'", "info")
+        
+    except Exception as e:
+        logger.debug(f"后台检查更新失败: {e}")
 
 def create_tray_icon():
     """创建精美的托盘图标"""
@@ -3376,6 +3444,8 @@ def on_tray_click(icon, item):
             run_optimization()
         elif item_str == "NVIDIA一键优化":
             run_nvidia_optimization(preset_name="low_latency")
+        elif item_str == "检查更新":
+            check_for_updates_action()
         elif item_str == "清理缓存":
             run_cleanup()
         elif item_str == "打开主窗口":
@@ -3803,6 +3873,7 @@ def run_tray_service():
             pystray.MenuItem("立即优化", on_tray_click),
             pystray.MenuItem("NVIDIA一键优化", on_tray_click),
             pystray.Menu.SEPARATOR,
+            pystray.MenuItem("检查更新", on_tray_click),
             pystray.MenuItem("清理缓存", on_tray_click),
             pystray.MenuItem("打开主窗口", on_tray_click),
             pystray.MenuItem("查看服务", on_tray_click),
@@ -3829,6 +3900,11 @@ def run_tray_service():
 
         # 初始化全局快捷键
         _init_shortcuts()
+
+        # 启动后台静默检查更新
+        import threading
+        threading.Thread(target=_background_check_updates, daemon=True).start()
+        safe_print("后台更新检查已启动")
 
         safe_print("\n智优进程管理器 v1.2.0 已启动")
         safe_print("智能游戏检测已启用")
