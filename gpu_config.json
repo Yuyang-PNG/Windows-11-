@@ -1,0 +1,8 @@
+{
+  "gpu_settings": {},
+  "priority_rules": {},
+  "gui_settings": {
+    "auto_optimize": true,
+    "cool_time": 5
+  }
+}
